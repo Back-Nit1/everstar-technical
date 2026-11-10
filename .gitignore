@@ -5,3 +5,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+# Output images from runs (dog_boxes.png and environment_boxes.png stay tracked)
+*_boxed.png
+*_boxes_*.png
