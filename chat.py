@@ -39,23 +39,39 @@ Example:
 
 # ---------- Tool ----------
 
-def _check_box(b) -> tuple:
-    """Validate one box from the model. Returns (label, [y_min, x_min, y_max, x_max]).
-    Error messages go back to the model so it can fix its next attempt."""
-    label, box = (b.get("label"), b.get("box")) if isinstance(b, dict) else (None, None)
-    if not isinstance(label, str) or not label.strip():
-        raise ValueError(f"each box needs a non-empty 'label': {b}")
-    if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box)):
-        raise ValueError(f"'box' must be 4 numbers [y_min, x_min, y_max, x_max]: {b}")
-    y0, x0, y1, x1 = box
-    if not (0 <= y0 < y1 <= 1000 and 0 <= x0 < x1 <= 1000):
-        raise ValueError(f"box {box} for {label!r} must be [y_min, x_min, y_max, x_max], 0-1000, min < max")
-    return label, box
+def validate_boxes(boxes) -> None:
+    """Checked by the agent before draw_bounding_boxes runs. Messages go back to the model to fix its next try."""
+    if not isinstance(boxes, list):
+        raise TypeError(f"'boxes' must be a list, got {type(boxes).__name__}")
+    if not boxes:
+        raise ValueError("'boxes' must contain at least one box")
+    for i, b in enumerate(boxes):
+        where = f"boxes[{i}]"
+        if not isinstance(b, dict):
+            raise TypeError(f"{where} must be an object with 'label' and 'box', got {type(b).__name__}")
+        if b.keys() != {"label", "box"}:
+            raise ValueError(f"{where} must have exactly the keys 'label' and 'box', got {sorted(b)}")
+        label, box = b["label"], b["box"]
+        if not isinstance(label, str):
+            raise TypeError(f"{where}.label must be a string, got {type(label).__name__}")
+        if not label.strip():
+            raise ValueError(f"{where}.label must not be empty")
+        if not isinstance(box, list):
+            raise TypeError(f"{where}.box must be a list [y_min, x_min, y_max, x_max], got {type(box).__name__}")
+        if len(box) != 4:
+            raise ValueError(f"{where}.box must have exactly 4 values [y_min, x_min, y_max, x_max], got {len(box)}")
+        not_whole = [v for v in box if type(v) is not int]  # rejects decimals, true/false, null, strings
+        if not_whole:
+            raise TypeError(f"{where}.box values must be whole numbers, got {not_whole}")
+        if not all(0 <= v <= 1000 for v in box):
+            raise ValueError(f"{where}.box values must be between 0 and 1000, got {box}")
+        y_min, x_min, y_max, x_max = box
+        if not (y_min < y_max and x_min < x_max):
+            raise ValueError(f"{where}.box needs y_min < y_max and x_min < x_max, got {box}")
 
 
 def draw_bounding_boxes(image: Image.Image, image_path: str, boxes: list) -> dict:
-    if not isinstance(boxes, list) or not boxes:
-        raise ValueError("boxes must be a non-empty list")
+    """Draw already-validated boxes (see validate_boxes) and save <name>_boxes.png."""
     out = image.convert("RGBA")
     w, h = out.size
     draw = ImageDraw.Draw(out)
@@ -63,7 +79,7 @@ def draw_bounding_boxes(image: Image.Image, image_path: str, boxes: list) -> dic
     font = ImageFont.load_default(size=max(12, min(w, h) // 25))
     drawn = []
     for b in boxes:
-        label, (y0, x0, y1, x1) = _check_box(b)
+        label, (y0, x0, y1, x1) = b["label"], b["box"]
         px = [round(x0 * w / 1000), round(y0 * h / 1000), round(x1 * w / 1000), round(y1 * h / 1000)]  # [x_min, y_min, x_max, y_max]
         draw.rectangle(px, outline="red", width=line)
         draw.rectangle(draw.textbbox((px[0], px[1]), label, font=font), fill="red")
@@ -80,8 +96,17 @@ def draw_bounding_boxes(image: Image.Image, image_path: str, boxes: list) -> dic
 tools = [Tool(
     name="draw_bounding_boxes",
     description="Draw labeled bounding boxes on the user's image and save a new copy.",
-    parameter_schema={"boxes": 'list of {"label": str, "box": [y_min, x_min, y_max, x_max]}, coordinates 0-1000'},
+    parameter_schema={"boxes": {
+        "type": "list, at least 1 item",
+        "items": {
+            "label": "string: non-empty object name, e.g. \"dog\"",
+            "box": "list of exactly 4 whole numbers [y_min, x_min, y_max, x_max], each 0-1000, "
+                   "y_min < y_max, x_min < x_max",
+        },
+        "rules": "each item has only \"label\" and \"box\"; no decimals, true/false, null or extra fields",
+    }},
     function=draw_bounding_boxes,
+    validate=validate_boxes,
 )]
 
 

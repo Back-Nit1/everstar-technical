@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 from dataclasses import dataclass
@@ -32,8 +33,9 @@ class Message:
 class Tool:
     name: str
     description: str
-    parameter_schema: Dict[str, Any]         # argument name -> description; all are required
+    parameter_schema: Dict[str, Any]         # argument name -> expected shape (shown to the model); all required, no others allowed
     function: Callable[..., Dict[str, Any]]  # called as function(image=, image_path=, **arguments)
+    validate: Optional[Callable[..., None]] = None  # validate(**arguments): raises TypeError/ValueError on bad values
 
     def __post_init__(self):
         """Reject bad tool definitions at startup, before any model call."""
@@ -43,6 +45,8 @@ class Tool:
             raise TypeError(f"tool {self.name!r}: parameter_schema must be a dict")
         if not callable(self.function):
             raise TypeError(f"tool {self.name!r}: function must be callable")
+        if self.validate is not None and not callable(self.validate):
+            raise TypeError(f"tool {self.name!r}: validate must be callable")
         if not self.name.strip() or not self.description.strip():
             raise ValueError("tool name and description must not be empty")
         if not all(isinstance(k, str) and k.strip() for k in self.parameter_schema):
@@ -181,15 +185,31 @@ class Agent:
                        f"Gave up after {self.max_attempts} attempts. Last error: {messages[-1].content}")
 
     def call_tool(self, call: Dict[str, Any], image: Image.Image, image_path: str) -> Dict[str, Any]:
-        """Run a tool. Never raises: problems come back as {"success": False, "error": ...}."""
+        """Check the model's arguments, then run the tool. The tool function runs only if every check passes.
+        Never raises: problems come back as {"success": False, "error": ...} for the model to fix."""
         tool = self.tools.get(call["name"])
         if tool is None:
             return {"success": False, "error": f"unknown tool {call['name']!r}; available: {list(self.tools)}"}
-        missing = [p for p in tool.parameter_schema if p not in call["arguments"]]
+        arguments = call["arguments"]
+
+        # 1. Exactly the declared arguments: none missing, nothing extra (e.g. a path or image from the model).
+        missing = [p for p in tool.parameter_schema if p not in arguments]
         if missing:
             return {"success": False, "error": f"missing arguments: {missing}"}
+        unexpected = [a for a in arguments if a not in tool.parameter_schema]
+        if unexpected:
+            return {"success": False, "error": f"unexpected arguments: {unexpected}; "
+                                               f"expected only {list(tool.parameter_schema)}"}
+        # 2. Values are valid (tool-specific checks), and 3. the call fits the function's signature.
         try:
-            # image/image_path come from Python; the model only supplies the arguments.
-            return tool.function(image=image, image_path=image_path, **call["arguments"])
+            if tool.validate is not None:
+                tool.validate(**arguments)
+            inspect.signature(tool.function).bind(image=image, image_path=image_path, **arguments)
+        except (TypeError, ValueError) as e:
+            return {"success": False, "error": f"invalid arguments: {type(e).__name__}: {e}"}
+
+        # 4. Run it. image/image_path come from Python; the model only supplies the arguments.
+        try:
+            return tool.function(image=image, image_path=image_path, **arguments)
         except Exception as e:
             return {"success": False, "error": f"{type(e).__name__}: {e}"}
