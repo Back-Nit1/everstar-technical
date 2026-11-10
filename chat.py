@@ -1,26 +1,41 @@
+import argparse
 import io
 import os
 import shlex
 import sys
 from functools import cache
-from typing import List
+from typing import Dict, List, Optional
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
 
 from agent import Agent, Message, Role, Tool
 
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+TIMEOUT_SECONDS = 30
+OUTPUT_FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG"}
+
+USAGE = """Usage:
+  python chat.py --image dog.png --prompt "Draw a box around the dog" --output dog_boxed.png
+  python chat.py --image environment.png --prompt "Box the cat and the dog"
+  python chat.py      (interactive chat)
+
+  --image   input image, JPEG or PNG
+  --prompt  what to box
+  --output  where to save the boxed image (.png, .jpg or .jpeg). Optional: by default it is saved
+            next to the image as <name>_boxes.png, then <name>_boxes_2.png, ... so earlier
+            results are never overwritten."""
 
 BANNER = f"""Bounding box agent ({MODEL})
-Write ONE line: what to box + the image path (JPEG or PNG).
-  Format:   Draw a box around the <object> in <image path>
+{USAGE}
+
+Interactive chat: write ONE line with what to box + the image path.
   Examples: Draw a box around the dog in dog.png
-            Draw a box around the tree in environment.png
             Box the cat and the dog in environment.png
             Is there a car in environment.png?   (no box if it isn't there)
-Output is saved next to the image as <name>_boxes.png. Type 'exit' to quit.
+Type 'exit' to quit.
 """
 
 BOX_FORMAT = """Bounding box format (strict):
@@ -70,8 +85,29 @@ def validate_boxes(boxes) -> None:
             raise ValueError(f"{where}.box needs y_min < y_max and x_min < x_max, got {box}")
 
 
-def draw_bounding_boxes(image: Image.Image, image_path: str, boxes: list) -> dict:
-    """Draw already-validated boxes (see validate_boxes) and save <name>_boxes.png."""
+def next_free_path(image_path: str) -> str:
+    """<name>_boxes.png, then <name>_boxes_2.png, _3, ... so earlier results are never overwritten."""
+    stem = os.path.splitext(image_path)[0] + "_boxes"
+    path, n = stem + ".png", 1
+    while os.path.exists(path):
+        n += 1
+        path = f"{stem}_{n}.png"
+    return path
+
+
+def check_output(output_path: str, image_path: str) -> None:
+    """Checked before any model call, so a bad --output doesn't waste one."""
+    if os.path.splitext(output_path)[1].lower() not in OUTPUT_FORMATS:
+        raise ValueError(f"--output must end in .png, .jpg or .jpeg: {output_path}")
+    folder = os.path.dirname(output_path) or "."
+    if not os.path.isdir(folder):
+        raise ValueError(f"--output folder does not exist: {folder}")
+    if os.path.realpath(output_path) == os.path.realpath(image_path):
+        raise ValueError("--output must not be the input image (it would be overwritten)")
+
+
+def draw_bounding_boxes(image: Image.Image, image_path: str, output_path: Optional[str], boxes: list) -> dict:
+    """Draw already-validated boxes (see validate_boxes). Saves to output_path, or next_free_path() if None."""
     out = image.convert("RGBA")
     w, h = out.size
     draw = ImageDraw.Draw(out)
@@ -86,8 +122,9 @@ def draw_bounding_boxes(image: Image.Image, image_path: str, boxes: list) -> dic
         draw.text((px[0], px[1]), label, fill="white", font=font)
         drawn.append({"label": label, "box_px": px})
 
-    out_path = os.path.splitext(image_path)[0] + "_boxes.png"  # overwrites an earlier result for the same image
-    out.save(out_path)
+    out_path = output_path or next_free_path(image_path)
+    fmt = OUTPUT_FORMATS[os.path.splitext(out_path)[1].lower()]
+    (out.convert("RGB") if fmt == "JPEG" else out).save(out_path, format=fmt)  # JPEG has no alpha channel
     labels = ", ".join(d["label"] for d in drawn)
     return {"success": True, "output_path": out_path, "num_boxes": len(drawn), "boxes": drawn,
             "message": f"Drew {len(drawn)} box(es) ({labels}). Saved to {out_path}"}
@@ -114,7 +151,39 @@ tools = [Tool(
 
 @cache
 def client() -> genai.Client:
-    return genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY
+    # Reads GEMINI_API_KEY / GOOGLE_API_KEY. The SDK does not retry by default, so this is the full wait.
+    return genai.Client(http_options=types.HttpOptions(timeout=TIMEOUT_SECONDS * 1000))  # milliseconds
+
+
+# HTTP status -> (error_type, what the user should do)
+API_ERRORS = {
+    400: ("bad_request", "Gemini rejected the request."),
+    401: ("invalid_api_key", "Check GEMINI_API_KEY."),
+    403: ("permission_denied", "This API key is not allowed to use this model."),
+    404: ("model_not_found", f"Model {MODEL!r} was not found. Set GEMINI_MODEL to an available model."),
+    429: ("rate_limited", "Too many requests or quota used up. Wait a bit and try again."),
+}
+
+
+def explain_api_error(e: Exception) -> Dict[str, str]:
+    """Sort a failed model call into a category the user can act on: {"error_type", "error"}."""
+    name = type(e).__name__
+    if "Timeout" in name:  # httpx/httpx2 ConnectTimeout, ReadTimeout, ...
+        return {"error_type": "timeout", "error": f"Gemini did not answer within {TIMEOUT_SECONDS} seconds. Try again."}
+    if name == "ConnectError" or isinstance(e, ConnectionError):
+        return {"error_type": "network_error", "error": f"Could not reach Gemini. Check the internet connection. ({e})"}
+    if isinstance(e, genai_errors.APIError):
+        detail = f"{e.code} {e.status}: {e.message}"
+        if "API_KEY_INVALID" in str(e.details):  # Gemini reports a bad key as 400, not 401
+            error_type, advice = API_ERRORS[401]
+        elif e.code in API_ERRORS:
+            error_type, advice = API_ERRORS[e.code]
+        elif e.code >= 500:
+            error_type, advice = "server_error", "Gemini had a server problem. Try again later."
+        else:
+            error_type, advice = "api_error", "Gemini returned an error."
+        return {"error_type": error_type, "error": f"{advice} ({detail})"}
+    return {"error_type": "unexpected_error", "error": f"{name}: {e}"}
 
 
 def gemini_llm(system_prompt: str, messages: List[Message], image: Image.Image) -> str:
@@ -156,27 +225,49 @@ def find_image_path(text: str):
     return next((p for p in paths if os.path.isfile(p)), None)
 
 
-def handle(messages: List[Message], user_input: str):
+def handle(messages: List[Message], prompt: str, image_path: Optional[str], output_path: Optional[str] = None):
     """One user turn: record it, run the agent, print the trail and the answer."""
-    messages.append(Message(Role.USER, user_input, image_path=find_image_path(user_input)))
+    messages.append(Message(Role.USER, prompt, image_path=image_path))
     before = len(messages)
     try:
-        response = agent.run(messages=messages)
-    except Exception as e:  # API/network errors
-        response = Message(Role.ASSISTANT, f"Model call failed: {e}")
+        answer = agent.run(messages, output_path=output_path).content
+    except Exception as e:
+        error = explain_api_error(e)
+        answer = f"Model call failed [{error['error_type']}]: {error['error']}"
     for m in messages[before:]:  # model replies, tool results, retries
         print(f"  [{m.tool_name or m.role.value}] {m.content}")
-    messages.append(response)
-    print(f"AI: {response.content}")
+    # Not added to `messages`: the history already holds the model's JSON reply (see Agent.run).
+    print(f"AI: {answer}")
 
 
-def chat():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Draw bounding boxes around objects in an image with Gemini.",
+                                     epilog=USAGE, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--image", help="input image, JPEG or PNG")
+    parser.add_argument("--prompt", help="what to box")
+    parser.add_argument("--output", help="where to save the boxed image (.png, .jpg or .jpeg)")
+    args = parser.parse_args()
+    if bool(args.image) != bool(args.prompt):
+        parser.error("--image and --prompt must be given together")
+    if args.output and not args.image:
+        parser.error("--output needs --image and --prompt")
+    if args.output:
+        try:
+            check_output(args.output, args.image)
+        except ValueError as e:
+            parser.error(str(e))
+    return args
+
+
+def main():
+    args = parse_args()  # before the key check, so --help works without a key
     if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
         sys.exit("GEMINI_API_KEY is not set. Run: export GEMINI_API_KEY=your-key")
-    messages = []
-    if sys.argv[1:]:  # one-shot: python chat.py "box the dog in dog.png"
-        return handle(messages, " ".join(sys.argv[1:]))
+    if args.image:  # one request from the flags
+        return handle([], args.prompt, args.image, args.output)
+
     print(BANNER)
+    messages = []
     while True:
         try:
             user_input = input("You: ")
@@ -184,8 +275,8 @@ def chat():
             break
         if user_input.lower() == "exit":
             break
-        handle(messages, user_input)
+        handle(messages, user_input, find_image_path(user_input))
 
 
 if __name__ == "__main__":
-    chat()
+    main()

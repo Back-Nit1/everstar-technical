@@ -34,7 +34,7 @@ class Tool:
     name: str
     description: str
     parameter_schema: Dict[str, Any]         # argument name -> expected shape (shown to the model); all required, no others allowed
-    function: Callable[..., Dict[str, Any]]  # called as function(image=, image_path=, **arguments)
+    function: Callable[..., Dict[str, Any]]  # called as function(image=, image_path=, output_path=, **arguments)
     validate: Optional[Callable[..., None]] = None  # validate(**arguments): raises TypeError/ValueError on bad values
 
     def __post_init__(self):
@@ -148,14 +148,16 @@ class Agent:
                             for t in self.tools.values())
         self.system_prompt = PROTOCOL.format(tools=listing) + (f"\n\n{instructions}" if instructions else "")
 
-    def run(self, messages: List[Message]) -> Message:
-        """Handle the latest user request. The model/tool trail is appended to `messages`;
-        the final answer is returned (not appended)."""
+    def run(self, messages: List[Message], output_path: Optional[str] = None) -> Message:
+        """Handle the latest user request. The model/tool trail is appended to `messages`.
+        The final answer is only returned: the history already holds the model's own JSON reply,
+        so appending a plain-text copy would show the model the same answer twice.
+        output_path is passed to the tool (None = the tool picks a default)."""
         # 1. Find and load the newest image in the conversation (no image = no model call).
         image_path = next((m.image_path for m in reversed(messages) if m.image_path), None)
         if image_path is None:
-            return Message(Role.ASSISTANT, "Please write your request and the image path in one line, "
-                                           "e.g. Draw a box around the dog in dog.png")
+            return Message(Role.ASSISTANT, "Please give an image, e.g. --image dog.png, "
+                                           "or write the request and the image path in one line.")
         try:
             image = load_image(image_path)
         except Exception as e:
@@ -174,7 +176,7 @@ class Agent:
             if call["type"] == "final":
                 return Message(Role.ASSISTANT, call["message"])
 
-            result = self.call_tool(call, image, image_path)
+            result = self.call_tool(call, image, image_path, output_path)
             messages.append(Message(Role.TOOL, json.dumps(result), tool_name=call["name"]))
             if result.get("success"):
                 # Success ends the turn; the result is not sent back to the model (saves an API call).
@@ -184,32 +186,40 @@ class Agent:
         return Message(Role.ASSISTANT,
                        f"Gave up after {self.max_attempts} attempts. Last error: {messages[-1].content}")
 
-    def call_tool(self, call: Dict[str, Any], image: Image.Image, image_path: str) -> Dict[str, Any]:
+    def call_tool(self, call: Dict[str, Any], image: Image.Image, image_path: str,
+                  output_path: Optional[str] = None) -> Dict[str, Any]:
         """Check the model's arguments, then run the tool. The tool function runs only if every check passes.
-        Never raises: problems come back as {"success": False, "error": ...} for the model to fix."""
+        Never raises: problems come back as tool_error(...) for the model to fix."""
         tool = self.tools.get(call["name"])
         if tool is None:
-            return {"success": False, "error": f"unknown tool {call['name']!r}; available: {list(self.tools)}"}
+            return tool_error("unknown_tool", f"unknown tool {call['name']!r}; available: {list(self.tools)}")
         arguments = call["arguments"]
+        context = {"image": image, "image_path": image_path, "output_path": output_path}  # from Python, never the model
 
         # 1. Exactly the declared arguments: none missing, nothing extra (e.g. a path or image from the model).
         missing = [p for p in tool.parameter_schema if p not in arguments]
         if missing:
-            return {"success": False, "error": f"missing arguments: {missing}"}
+            return tool_error("missing_arguments", f"missing arguments: {missing}")
         unexpected = [a for a in arguments if a not in tool.parameter_schema]
         if unexpected:
-            return {"success": False, "error": f"unexpected arguments: {unexpected}; "
-                                               f"expected only {list(tool.parameter_schema)}"}
+            return tool_error("unexpected_arguments",
+                              f"unexpected arguments: {unexpected}; expected only {list(tool.parameter_schema)}")
         # 2. Values are valid (tool-specific checks), and 3. the call fits the function's signature.
         try:
             if tool.validate is not None:
                 tool.validate(**arguments)
-            inspect.signature(tool.function).bind(image=image, image_path=image_path, **arguments)
+            inspect.signature(tool.function).bind(**context, **arguments)
         except (TypeError, ValueError) as e:
-            return {"success": False, "error": f"invalid arguments: {type(e).__name__}: {e}"}
+            return tool_error("invalid_arguments", f"{type(e).__name__}: {e}")
 
-        # 4. Run it. image/image_path come from Python; the model only supplies the arguments.
+        # 4. Run it.
         try:
-            return tool.function(image=image, image_path=image_path, **arguments)
+            return tool.function(**context, **arguments)
         except Exception as e:
-            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+            return tool_error("tool_failed", f"{type(e).__name__}: {e}")
+
+
+def tool_error(error_type: str, message: str) -> Dict[str, Any]:
+    """Every failed tool call has this shape. error_type is one of: unknown_tool, missing_arguments,
+    unexpected_arguments, invalid_arguments, tool_failed."""
+    return {"success": False, "error_type": error_type, "error": message}
