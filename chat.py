@@ -37,6 +37,22 @@ Example:
 {"type":"tool_call","name":"draw_bounding_boxes","arguments":{"boxes":[{"label":"dog","box":[630,680,815,895]}]}}"""
 
 
+# ---------- Tool ----------
+
+def _check_box(b) -> tuple:
+    """Validate one box from the model. Returns (label, [y_min, x_min, y_max, x_max]).
+    Error messages go back to the model so it can fix its next attempt."""
+    label, box = (b.get("label"), b.get("box")) if isinstance(b, dict) else (None, None)
+    if not isinstance(label, str) or not label.strip():
+        raise ValueError(f"each box needs a non-empty 'label': {b}")
+    if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box)):
+        raise ValueError(f"'box' must be 4 numbers [y_min, x_min, y_max, x_max]: {b}")
+    y0, x0, y1, x1 = box
+    if not (0 <= y0 < y1 <= 1000 and 0 <= x0 < x1 <= 1000):
+        raise ValueError(f"box {box} for {label!r} must be [y_min, x_min, y_max, x_max], 0-1000, min < max")
+    return label, box
+
+
 def draw_bounding_boxes(image: Image.Image, image_path: str, boxes: list) -> dict:
     if not isinstance(boxes, list) or not boxes:
         raise ValueError("boxes must be a non-empty list")
@@ -47,26 +63,29 @@ def draw_bounding_boxes(image: Image.Image, image_path: str, boxes: list) -> dic
     font = ImageFont.load_default(size=max(12, min(w, h) // 25))
     drawn = []
     for b in boxes:
-        label, box = (b.get("label"), b.get("box")) if isinstance(b, dict) else (None, None)
-        if not isinstance(label, str) or not label.strip():
-            raise ValueError(f"each box needs a non-empty 'label': {b}")
-        if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box)):
-            raise ValueError(f"'box' must be 4 numbers [y_min, x_min, y_max, x_max]: {b}")
-        y0, x0, y1, x1 = box
-        if not (0 <= y0 < y1 <= 1000 and 0 <= x0 < x1 <= 1000):
-            raise ValueError(f"box {box} for {label!r} must be [y_min, x_min, y_max, x_max], 0-1000, min < max")
-        px = [round(x0 * w / 1000), round(y0 * h / 1000), round(x1 * w / 1000), round(y1 * h / 1000)]
+        label, (y0, x0, y1, x1) = _check_box(b)
+        px = [round(x0 * w / 1000), round(y0 * h / 1000), round(x1 * w / 1000), round(y1 * h / 1000)]  # [x_min, y_min, x_max, y_max]
         draw.rectangle(px, outline="red", width=line)
         draw.rectangle(draw.textbbox((px[0], px[1]), label, font=font), fill="red")
         draw.text((px[0], px[1]), label, fill="white", font=font)
-        drawn.append({"label": label, "box_px": px})  # [x_min, y_min, x_max, y_max] in pixels
+        drawn.append({"label": label, "box_px": px})
 
-    out_path = os.path.splitext(image_path)[0] + "_boxes.png"
+    out_path = os.path.splitext(image_path)[0] + "_boxes.png"  # overwrites an earlier result for the same image
     out.save(out_path)
     labels = ", ".join(d["label"] for d in drawn)
     return {"success": True, "output_path": out_path, "num_boxes": len(drawn), "boxes": drawn,
             "message": f"Drew {len(drawn)} box(es) ({labels}). Saved to {out_path}"}
 
+
+tools = [Tool(
+    name="draw_bounding_boxes",
+    description="Draw labeled bounding boxes on the user's image and save a new copy.",
+    parameter_schema={"boxes": 'list of {"label": str, "box": [y_min, x_min, y_max, x_max]}, coordinates 0-1000'},
+    function=draw_bounding_boxes,
+)]
+
+
+# ---------- Gemini provider ----------
 
 @cache
 def client() -> genai.Client:
@@ -77,51 +96,50 @@ def gemini_llm(system_prompt: str, messages: List[Message], image: Image.Image) 
     """Plain text in, plain text out. No SDK tool calling: the protocol is our own JSON."""
     buf = io.BytesIO()
     image.save(buf, format="PNG")
-    # Attach the image once, to the newest message that named it (older images are not resent).
+    # ponytail: full-size PNG sent inline; very large photos can pass Gemini's ~20MB request limit, downscale if that happens
+    image_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
+    # The image goes once, on the newest message that named it (older images are not resent).
     image_at = max(i for i, m in enumerate(messages) if m.image_path)
+
     contents = []
     for i, m in enumerate(messages):
-        text = m.content
-        if m.role in (Role.TOOL, Role.SYSTEM):
-            text = f"[{m.tool_name or m.role.value} result] {m.content}"
-        parts = [types.Part.from_text(text=text)]
-        if i == image_at:
-            parts.insert(0, types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"))
+        # Tool results and rejection notes are sent as user turns, labeled so the model can tell them apart.
+        text = f"[{m.tool_name or m.role.value} result] {m.content}" if m.role in (Role.TOOL, Role.SYSTEM) else m.content
+        parts = [image_part] if i == image_at else []
+        parts.append(types.Part.from_text(text=text))
         contents.append(types.Content(role="model" if m.role == Role.ASSISTANT else "user", parts=parts))
+
     response = client().models.generate_content(
         model=MODEL, contents=contents,
         config=types.GenerateContentConfig(system_instruction=system_prompt))
     return response.text or ""
 
 
-tools = [Tool(
-    name="draw_bounding_boxes",
-    description="Draw labeled bounding boxes on the user's image and save a new copy.",
-    parameter_schema={"boxes": 'list of {"label": str, "box": [y_min, x_min, y_max, x_max]}, coordinates 0-1000'},
-    function=draw_bounding_boxes,
-)]
-
 agent = Agent(tools=tools, llm=gemini_llm, instructions=BOX_FORMAT)
 
+
+# ---------- Chat loop ----------
 
 def find_image_path(text: str):
     """First token in the input that is an existing file (validated later by load_image)."""
     try:
         tokens = shlex.split(text)  # handles quoted / backslash-escaped paths from drag-and-drop
-    except ValueError:
+    except ValueError:              # e.g. an unmatched quote
         tokens = text.split()
     paths = (os.path.expanduser(t.rstrip("?!.,;:")) for t in tokens)  # "dog.png?" -> "dog.png"
+    # ponytail: picks the first existing file, so a word that matches a file name (e.g. "agent.py") wins; prefer image extensions if that bites
     return next((p for p in paths if os.path.isfile(p)), None)
 
 
 def handle(messages: List[Message], user_input: str):
+    """One user turn: record it, run the agent, print the trail and the answer."""
     messages.append(Message(Role.USER, user_input, image_path=find_image_path(user_input)))
     before = len(messages)
     try:
         response = agent.run(messages=messages)
     except Exception as e:  # API/network errors
         response = Message(Role.ASSISTANT, f"Model call failed: {e}")
-    for m in messages[before:]:  # show the trail: model replies, tool results, retries
+    for m in messages[before:]:  # model replies, tool results, retries
         print(f"  [{m.tool_name or m.role.value}] {m.content}")
     messages.append(response)
     print(f"AI: {response.content}")
@@ -135,7 +153,10 @@ def chat():
         return handle(messages, " ".join(sys.argv[1:]))
     print(BANNER)
     while True:
-        user_input = input("You: ")
+        try:
+            user_input = input("You: ")
+        except EOFError:  # Ctrl-D
+            break
         if user_input.lower() == "exit":
             break
         handle(messages, user_input)

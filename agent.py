@@ -32,23 +32,21 @@ class Message:
 class Tool:
     name: str
     description: str
-    parameter_schema: Dict[str, Any]  # argument name -> description; all are required
+    parameter_schema: Dict[str, Any]         # argument name -> description; all are required
     function: Callable[..., Dict[str, Any]]  # called as function(image=, image_path=, **arguments)
 
     def __post_init__(self):
-        # Reject bad tool definitions at startup, before any model call.
-        for field in ("name", "description"):
-            value = getattr(self, field)
-            if not isinstance(value, str):
-                raise TypeError(f"tool {field} must be a string, got {type(value).__name__}")
-            if not value.strip():
-                raise ValueError(f"tool {field} must not be empty")
+        """Reject bad tool definitions at startup, before any model call."""
+        if not isinstance(self.name, str) or not isinstance(self.description, str):
+            raise TypeError("tool name and description must be strings")
         if not isinstance(self.parameter_schema, dict):
             raise TypeError(f"tool {self.name!r}: parameter_schema must be a dict")
-        if not all(isinstance(k, str) and k.strip() for k in self.parameter_schema):
-            raise ValueError(f"tool {self.name!r}: parameter names must be non-empty strings")
         if not callable(self.function):
             raise TypeError(f"tool {self.name!r}: function must be callable")
+        if not self.name.strip() or not self.description.strip():
+            raise ValueError("tool name and description must not be empty")
+        if not all(isinstance(k, str) and k.strip() for k in self.parameter_schema):
+            raise ValueError(f"tool {self.name!r}: parameter names must be non-empty strings")
 
 
 # Provider = any function (system_prompt, messages, image) -> raw model text.
@@ -57,22 +55,21 @@ LLM = Callable[[str, List[Message], Image.Image], str]
 
 
 def load_image(path: str) -> Image.Image:
-    """Open a JPEG/PNG: must exist, be still (not animated) and pass verify().
-    Returns an upright (EXIF-rotated), fully decoded copy."""
+    """Open a still JPEG/PNG that passes verify(). Returns an upright (EXIF-rotated), decoded copy."""
     if not os.path.isfile(path):
         raise ValueError(f"image not found: {path}")
     with Image.open(path) as img:
         if img.format not in ("JPEG", "PNG"):
             raise ValueError(f"unsupported image type {img.format}; only JPEG and PNG are allowed")
-        if getattr(img, "n_frames", 1) != 1:  # explicit multi-page / animation check (e.g. APNG)
+        if getattr(img, "n_frames", 1) != 1:  # animated PNG, multi-page files
             raise ValueError(f"image has {img.n_frames} pages/frames; "
                              "multi-page and animated images are not supported")
         img.verify()  # integrity check; Pillow needs the file reopened afterwards
     with Image.open(path) as img:
-        img = ImageOps.exif_transpose(img)  # so boxes match the orientation the model sees
-        img.load()
-        return img.copy()
+        return ImageOps.exif_transpose(img)  # returns a fully loaded copy; boxes match what the model sees
 
+
+# ---------- Parsing the model's reply ----------
 
 def _no_duplicate_keys(pairs):
     keys = [k for k, _ in pairs]
@@ -80,6 +77,17 @@ def _no_duplicate_keys(pairs):
     if duplicates:
         raise ValueError(f"duplicate JSON keys: {duplicates}")
     return dict(pairs)
+
+
+def _is_final(reply: dict) -> bool:
+    return (reply.keys() == {"type", "message"} and reply["type"] == "final"
+            and isinstance(reply["message"], str))
+
+
+def _is_tool_call(reply: dict) -> bool:
+    return (reply.keys() == {"type", "name", "arguments"} and reply["type"] == "tool_call"
+            and isinstance(reply["name"], str) and bool(reply["name"].strip())
+            and isinstance(reply["arguments"], dict))
 
 
 def parse_reply(text: str) -> Dict[str, Any]:
@@ -92,16 +100,14 @@ def parse_reply(text: str) -> Dict[str, Any]:
         raise ValueError(f"reply is not a single JSON object ({e})") from None
     if not isinstance(reply, dict):
         raise ValueError("reply must be a JSON object")
-    if (reply.keys() == {"type", "message"} and reply["type"] == "final"
-            and isinstance(reply["message"], str)):
-        return reply
-    if (reply.keys() == {"type", "name", "arguments"} and reply["type"] == "tool_call"
-            and isinstance(reply["name"], str) and reply["name"].strip()
-            and isinstance(reply["arguments"], dict)):
+    if _is_final(reply) or _is_tool_call(reply):
         return reply
     raise ValueError('expected exactly {"type":"tool_call","name":"...","arguments":{...}} '
                      'or {"type":"final","message":"..."}')
 
+
+# ---------- System prompt ----------
+# {{ and }} are literal braces (str.format); {tools} is filled with the tool list.
 
 PROTOCOL = """You control Python tools by replying with JSON.
 
@@ -121,6 +127,8 @@ Tools:
 If a tool result reports an error, fix the arguments and call the tool again."""
 
 
+# ---------- Agent ----------
+
 class Agent:
     def __init__(self, tools: List[Tool], llm: LLM, instructions: str = "", max_attempts: int = 3):
         self.tools: Dict[str, Tool] = {}
@@ -133,12 +141,13 @@ class Agent:
         self.llm = llm
         self.max_attempts = max_attempts
         listing = "\n".join(f"- {t.name}: {t.description}\n  arguments: {json.dumps(t.parameter_schema)}"
-                            for t in tools)
+                            for t in self.tools.values())
         self.system_prompt = PROTOCOL.format(tools=listing) + (f"\n\n{instructions}" if instructions else "")
 
     def run(self, messages: List[Message]) -> Message:
         """Handle the latest user request. The model/tool trail is appended to `messages`;
         the final answer is returned (not appended)."""
+        # 1. Find and load the newest image in the conversation (no image = no model call).
         image_path = next((m.image_path for m in reversed(messages) if m.image_path), None)
         if image_path is None:
             return Message(Role.ASSISTANT, "Please write your request and the image path in one line, "
@@ -148,9 +157,8 @@ class Agent:
         except Exception as e:
             return Message(Role.ASSISTANT, f"Can't use that image: {e}")
 
+        # 2. Ask the model (whole conversation), parse, run the tool; retry on any error.
         for _ in range(self.max_attempts):
-            # The model sees the whole conversation, so a request and its image path
-            # can arrive in separate messages ("box the tree" ... "environment.png").
             reply = self.llm(self.system_prompt, messages, image)
             messages.append(Message(Role.ASSISTANT, reply))
             try:
@@ -161,15 +169,19 @@ class Agent:
                 continue
             if call["type"] == "final":
                 return Message(Role.ASSISTANT, call["message"])
+
             result = self.call_tool(call, image, image_path)
             messages.append(Message(Role.TOOL, json.dumps(result), tool_name=call["name"]))
             if result.get("success"):
                 # Success ends the turn; the result is not sent back to the model (saves an API call).
                 return Message(Role.ASSISTANT, result.get("message") or json.dumps(result))
+            # ponytail: every tool error is retried, even ones the model can't fix; add a non-retryable flag if that wastes calls
+
         return Message(Role.ASSISTANT,
                        f"Gave up after {self.max_attempts} attempts. Last error: {messages[-1].content}")
 
     def call_tool(self, call: Dict[str, Any], image: Image.Image, image_path: str) -> Dict[str, Any]:
+        """Run a tool. Never raises: problems come back as {"success": False, "error": ...}."""
         tool = self.tools.get(call["name"])
         if tool is None:
             return {"success": False, "error": f"unknown tool {call['name']!r}; available: {list(self.tools)}"}
