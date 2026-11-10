@@ -4,7 +4,7 @@ import os
 from PIL import Image
 
 from agent import Agent, Message, Role, Tool, load_image, parse_reply
-from chat import BOX_FORMAT, tools
+from chat import BOX_FORMAT, tools, validate_boxes
 
 
 def fake_llm(replies):
@@ -79,4 +79,13 @@ for bad in ["missing.png", "_t.gif", "_t_anim.png"]:
     except ValueError:
         pass
 os.remove("_t.gif"), os.remove("_t_anim.png")
+# 5. Labels are plain object names: paths and file names are rejected.
+for ok in ["dog", "black cat", "golden retriever", "St Bernard's dog", "T-rex", "chien"]:
+    validate_boxes([{"label": ok, "box": [1, 1, 2, 2]}])
+for bad in ["the tree in environment.png", "environment.png", "/Users/x/dog", "a\\b", "dog.", " dog", "x" * 41, "dog!"]:
+    try:
+        validate_boxes([{"label": bad, "box": [1, 1, 2, 2]}])
+        raise AssertionError(f"label {bad!r} should be rejected")
+    except ValueError:
+        pass
 print("all checks passed")

@@ -1,6 +1,7 @@
 import argparse
 import io
 import os
+import re
 import shlex
 import sys
 from functools import cache
@@ -44,7 +45,7 @@ BOX_FORMAT = """Bounding box format (strict):
 - y_min < y_max and x_min < x_max.
 - Box only the objects the user names; never box anything else. If the user does not say which object to box, reply with type "final" asking which object.
 - Box tightly around the whole visible object. One box per object; if the user asks for several objects or "all" of something, box each one.
-- "label" is a short name for the object, e.g. "dog".
+- "label" is only the object's name, e.g. "dog" or "black cat": letters, digits, spaces, - and ' only, at most 40 characters. Never put a file name, path, extension or the user's sentence in a label.
 - "boxes" always holds at least one box. If the requested object is not in the image, reply with type "final" and say so instead.
 - Only send labels and coordinates. Never send file paths or anything else.
 
@@ -53,6 +54,8 @@ Example:
 
 
 # ---------- Tool ----------
+
+LABEL_PATTERN = re.compile(r"[^\W_](?:[\w '-]{0,38}[^\W_])?")  # a plain name: no slashes, dots or other symbols
 
 def validate_boxes(boxes) -> None:
     """Checked by the agent before draw_bounding_boxes runs. Messages go back to the model to fix its next try."""
@@ -71,6 +74,8 @@ def validate_boxes(boxes) -> None:
             raise TypeError(f"{where}.label must be a string, got {type(label).__name__}")
         if not label.strip():
             raise ValueError(f"{where}.label must not be empty")
+        if not LABEL_PATTERN.fullmatch(label):  # blocks paths/file names like "environment.png" or "a/b"
+            raise ValueError(f"{where}.label must be only the object's name (letters, digits, spaces, - and ' only, at most 40 characters, no file names or paths), got {label!r}")
         if not isinstance(box, list):
             raise TypeError(f"{where}.box must be a list [y_min, x_min, y_max, x_max], got {type(box).__name__}")
         if len(box) != 4:
@@ -136,7 +141,7 @@ tools = [Tool(
     parameter_schema={"boxes": {
         "type": "list, at least 1 item",
         "items": {
-            "label": "string: non-empty object name, e.g. \"dog\"",
+            "label": "string: object name only, e.g. \"dog\"; letters, digits, spaces, - and ' only, max 40 characters, no file names or paths",
             "box": "list of exactly 4 whole numbers [y_min, x_min, y_max, x_max], each 0-1000, "
                    "y_min < y_max, x_min < x_max",
         },
