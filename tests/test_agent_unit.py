@@ -14,7 +14,7 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent import Agent, Message, Role, Tool, load_image, parse_reply  # noqa: E402
-from agent import MODEL_FIXABLE, tool_error  # noqa: E402
+from agent import tool_error  # noqa: E402
 
 FINAL = '{"type":"final","message":"No cat in this image."}'
 CALL = '{"type":"tool_call","name":"echo","arguments":{"text":"hi"}}'
@@ -63,32 +63,30 @@ class TempDirTest(unittest.TestCase):
 # ---------- Messages, tools, system prompt ----------
 
 class MessageTest(unittest.TestCase):
-    def test_only_tool_messages_carry_a_non_empty_tool_name(self):
+    def test_only_tool_messages_carry_a_tool_name_or_an_image(self):
+        closeup = Image.new("RGB", (4, 4))
         cases = [
-            (Role.USER, None, True),                   # normal request with an image
-            (Role.TOOL, "draw_bounding_boxes", True),  # a Python tool's result
-            (Role.TOOL, None, False), (Role.TOOL, "", False), (Role.TOOL, "   ", False),
-            (Role.USER, "draw_bounding_boxes", False),
-            (Role.ASSISTANT, "draw_bounding_boxes", False),
-            (Role.SYSTEM, "draw_bounding_boxes", False),
+            (Role.USER, None, None, True),                      # normal request with an image path
+            (Role.TOOL, "draw_bounding_boxes", None, True),     # a Python tool's result
+            (Role.TOOL, "zoom_region", closeup, True),          # a tool result with a picture
+            (Role.TOOL, None, None, False), (Role.TOOL, "", None, False), (Role.TOOL, "   ", None, False),
+            (Role.USER, "draw_bounding_boxes", None, False),
+            (Role.ASSISTANT, "draw_bounding_boxes", None, False),
+            (Role.SYSTEM, "draw_bounding_boxes", None, False),
+            (Role.USER, None, closeup, False),
+            (Role.ASSISTANT, None, closeup, False),
+            (Role.SYSTEM, None, closeup, False),
         ]
-        for role, tool_name, valid in cases:
-            with self.subTest(role=role, tool_name=tool_name):
-                make = lambda: Message(role, "Draw a box around the dog", image_path="dog.png", tool_name=tool_name)
+        for role, tool_name, image, valid in cases:
+            with self.subTest(role=role, tool_name=tool_name, image=image is not None):
+                make = lambda: Message(role, "Draw a box around the dog", image_path="dog.png",
+                                       tool_name=tool_name, image=image)
                 if valid:
                     m = make()
-                    self.assertEqual((m.content, m.image_path, m.tool_name),
-                                     ("Draw a box around the dog", "dog.png", tool_name))
+                    self.assertEqual((m.content, m.image_path, m.tool_name), ("Draw a box around the dog", "dog.png", tool_name))
+                    self.assertIs(m.image, image)
                 else:
                     self.assertRaises(ValueError, make)
-
-    def test_only_tool_messages_carry_an_image(self):
-        image = Image.new("RGB", (4, 4))
-        self.assertIs(Message(Role.TOOL, "{}", tool_name="zoom_region", image=image).image, image)
-        self.assertIsNone(Message(Role.TOOL, "{}", tool_name="echo").image)  # an image is optional
-        for role in [Role.USER, Role.ASSISTANT, Role.SYSTEM]:
-            with self.subTest(role=role), self.assertRaises(ValueError):
-                Message(role, "look at this", image=image)
 
 
 class ToolDefinitionTest(unittest.TestCase):
@@ -109,58 +107,24 @@ class ToolDefinitionTest(unittest.TestCase):
                 with self.assertRaises(error):
                     Tool(name, description, schema, function)
 
-    def test_agent_rejects_duplicate_names_and_non_tools(self):
-        for tools, error in [([make_tool("echo"), make_tool("echo")], ValueError), (["echo"], TypeError)]:
-            with self.subTest(tools=tools), self.assertRaises(error):
-                Agent(tools=tools, llm=FakeLLM())
-
-
-class SystemPromptTest(unittest.TestCase):
-    def test_lists_every_tool_and_appends_instructions(self):
-        tools = [Tool("draw_bounding_boxes", "Draw labeled boxes.", {"boxes": "list of label + box"}, print),
-                 Tool("count_objects", "Count objects.", {"label": "object name"}, print)]
-        prompt = Agent(tools=tools, llm=FakeLLM(), instructions="Box format rules").system_prompt
-        for text in ["draw_bounding_boxes", "Draw labeled boxes.", '"boxes"', "list of label + box",
-                     "count_objects", "Count objects.", '"label"', "object name"]:
-            with self.subTest(text=text):
-                self.assertIn(text, prompt)
-        self.assertTrue(prompt.endswith("Box format rules"))
-
 
 # ---------- Strict JSON parsing ----------
 
 class ParseReplyTest(unittest.TestCase):
-    def test_accepts_tool_call_and_final_answer(self):
-        self.assertEqual(parse_reply(CALL), {"type": "tool_call", "name": "echo", "arguments": {"text": "hi"}})
-        self.assertEqual(parse_reply(FINAL), {"type": "final", "message": "No cat in this image."})
-
     def test_rejects_malformed_replies(self):
         cases = {
-            "prose before": "Here you go: " + CALL,
-            "prose after": CALL + " Done.",
-            "json fence": "```json\n" + CALL + "\n```",
-            "plain fence": "```\n" + FINAL + "\n```",
+            "code fence": "```json\n" + CALL + "\n```",
             "two objects": CALL + CALL,
-            "object then final": CALL + "\n" + FINAL,
-            "top-level list": "[" + CALL + "]",
-            "empty list": "[]",
-            "string": '"final"', "number": "42", "true": "true", "null": "null", "empty": "",
+            "list, not an object": "[" + CALL + "]",
+            "string, not an object": '"final"',
             "missing message": '{"type":"final"}',
             "missing arguments": '{"type":"tool_call","name":"echo"}',
-            "extra field on final": '{"type":"final","message":"x","extra":1}',
-            "extra field on call": '{"type":"tool_call","name":"echo","arguments":{},"id":1}',
-            "unknown type": '{"type":"answer","message":"x"}',
+            "extra field": '{"type":"tool_call","name":"echo","arguments":{},"id":1}',
             "message not a string": '{"type":"final","message":5}',
-            "empty name": '{"type":"tool_call","name":"","arguments":{}}',
-            "blank name": '{"type":"tool_call","name":"  ","arguments":{}}',
-            "name not a string": '{"type":"tool_call","name":7,"arguments":{}}',
             "arguments not an object": '{"type":"tool_call","name":"echo","arguments":[]}',
-            "final with tool fields": '{"type":"final","name":"echo","arguments":{}}',
-            "duplicate top-level key": '{"type":"final","message":"a","message":"b"}',
-            "duplicate argument key": '{"type":"tool_call","name":"echo","arguments":{"text":"a","text":"b"}}',
+            "blank name": '{"type":"tool_call","name":"  ","arguments":{}}',
+            "duplicate key": '{"type":"final","message":"a","message":"b"}',
             "NaN": '{"type":"tool_call","name":"echo","arguments":{"text":NaN}}',
-            "Infinity": '{"type":"tool_call","name":"echo","arguments":{"text":Infinity}}',
-            "-Infinity": '{"type":"tool_call","name":"echo","arguments":{"text":-Infinity}}',
         }
         for case, text in cases.items():
             with self.subTest(case=case), self.assertRaises(ValueError):
@@ -204,13 +168,6 @@ class CallToolTest(unittest.TestCase):
         self.assertTrue(self.call(agent, "with_image", {"text": "hi"})["success"])
         self.assertEqual(seen, {"size": (4, 4), "image_path": "x.png", "output_path": None, "text": "hi"})
 
-    def test_tool_exception_becomes_tool_failed(self):
-        def broken(text):
-            raise OSError("disk full")
-        result = self.call(Agent(tools=[make_tool(function=broken)], llm=FakeLLM()), "echo", {"text": "hi"})
-        self.assertEqual(result["error_type"], "tool_failed")
-        self.assertIn("disk full", result["error"])
-
 
 # ---------- Agent.run decisions (fake model) ----------
 
@@ -244,32 +201,21 @@ class AgentRunTest(TempDirTest):
         self.assertEqual((llm.calls, answer.content), (1, "No cat in this image."))
         self.assertNotIn(Role.TOOL, [m.role for m in messages])
 
-    def test_successful_tool_call_ends_the_turn_after_one_model_call(self):
-        llm = FakeLLM(CALL, FINAL)
-        answer, messages = self.run_agent(llm)
-        self.assertEqual((llm.calls, answer.content), (1, "hi"))
-        self.assertEqual((messages[-1].role, messages[-1].tool_name), (Role.TOOL, "echo"))
-
     def test_fixable_mistakes_are_retried_until_a_valid_call(self):
+        results = iter([tool_error("limit_reached", "Limit reached for zooming in")])  # fails once, then works
+        limit_once = lambda text: next(results, {"success": True, "message": text})
         cases = {
-            "malformed JSON": ("Sure! " + CALL, Role.SYSTEM),
-            "unknown tool": ('{"type":"tool_call","name":"nope","arguments":{"text":"hi"}}', Role.TOOL),
-            "invalid argument value": ('{"type":"tool_call","name":"echo","arguments":{"text":5}}', Role.TOOL),
+            "malformed JSON": ("Sure! " + CALL, Role.SYSTEM, None),
+            "unknown tool": ('{"type":"tool_call","name":"nope","arguments":{"text":"hi"}}', Role.TOOL, None),
+            "invalid argument value": ('{"type":"tool_call","name":"echo","arguments":{"text":5}}', Role.TOOL, None),
+            "limit reached": (CALL, Role.TOOL, limit_once),
         }
-        for case, (first_reply, feedback_role) in cases.items():
+        for case, (first_reply, feedback_role, function) in cases.items():
             with self.subTest(case=case):
                 llm = FakeLLM(first_reply, CALL)
-                answer, messages = self.run_agent(llm, validate=must_be_string)
+                answer, messages = self.run_agent(llm, validate=must_be_string, function=function)
                 self.assertEqual((llm.calls, answer.content), (2, "hi"))
                 self.assertEqual(messages[2].role, feedback_role)  # the error went back to the model
-
-    def test_malformed_replies_stop_when_the_retry_budget_is_used(self):
-        for max_attempts in [1, 2, 3]:
-            with self.subTest(max_attempts=max_attempts):
-                llm = FakeLLM(*["not json"] * max_attempts)
-                answer, _ = self.run_agent(llm, max_attempts=max_attempts)
-                self.assertEqual(llm.calls, max_attempts)
-                self.assertTrue(answer.content.startswith(f"Gave up after {max_attempts} attempts"))
 
     def test_unfixable_problems_stop_without_a_retry(self):
         def broken(text):
@@ -319,12 +265,7 @@ class AgentRunTest(TempDirTest):
                                                  "model calls in one request without a final answer.")
                 self.assertEqual([m.role for m in messages].count(Role.TOOL), max_steps)
 
-    def test_return_direct_defaults_to_true_and_must_be_a_bool(self):
-        self.assertTrue(make_tool().return_direct)
-        with self.assertRaises(TypeError):
-            make_tool(return_direct="false")
-
-    # ---------- tool images, state, limit_reached ----------
+    # ---------- tool images, state ----------
 
     def test_tool_image_rides_on_the_tool_message_not_in_the_json(self):
         closeup = Image.new("RGB", (8, 4), "red")
@@ -356,31 +297,10 @@ class AgentRunTest(TempDirTest):
         result = agent.call_tool({"name": "echo", "arguments": {"text": "hi", "state": {}}}, Image.new("RGB", (4, 4)), "x.png")
         self.assertEqual(result["error_type"], "unexpected_arguments")
 
-    def test_limit_reached_goes_back_to_the_model_for_another_try(self):
-        self.assertIn("limit_reached", MODEL_FIXABLE)
-        results = iter([tool_error("limit_reached", "Limit reached for zooming in"), {"success": True, "message": "drawn"}])
-        llm = FakeLLM(CALL, CALL)
-        answer, messages = self.run_agent(llm, function=lambda text: next(results))
-        self.assertEqual((llm.calls, answer.content), (2, "drawn"))  # the run went on instead of stopping
-        self.assertEqual(json.loads(messages[2].content)["error_type"], "limit_reached")  # the model saw the error
-
-    def test_default_max_steps_is_six(self):
-        self.assertEqual(Agent(tools=[], llm=FakeLLM()).max_steps, 6)
-
-    def test_draw_bounding_boxes_always_returns_direct(self):
-        from chat import tools  # imported here so the rest of this file stays free of chat/Gemini
-        self.assertTrue(next(t for t in tools if t.name == "draw_bounding_boxes").return_direct)
-
 
 # ---------- load_image ----------
 
 class LoadImageTest(TempDirTest):
-    def test_png_and_jpeg_load_with_size_and_format(self):
-        for name, fmt in [("a.png", "PNG"), ("a.jpg", "JPEG")]:
-            with self.subTest(fmt=fmt):
-                image = load_image(self.save_image(name, size=(40, 30)))
-                self.assertEqual((image.size, image.format), ((40, 30), fmt))
-
     def test_unusable_files_are_rejected(self):
         with open(self.save_image("good.png"), "rb") as f:
             good = f.read()

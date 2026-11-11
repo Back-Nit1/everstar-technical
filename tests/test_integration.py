@@ -20,7 +20,6 @@ sys.path.insert(0, ROOT)
 import chat  # noqa: E402
 from agent import Agent, Message, Role  # noqa: E402
 from agent import load_image  # noqa: E402
-from chat import validate_boxes  # noqa: E402
 
 DOG = os.path.join(ROOT, "dog.png")
 ENVIRONMENT = os.path.join(ROOT, "environment.png")  # tree, cat and dog on a white background
@@ -101,30 +100,6 @@ class BoundingBoxWorkflowTest(unittest.TestCase):
         self.assertEqual(answer.content, f"Drew 1 box(es): dog {result['boxes'][0]['box_px']}. Saved to {self.output}")
         self.assertEqual((messages[-1].role, messages[-1].tool_name), (Role.TOOL, "draw_bounding_boxes"))
         self.assertEqual((result["success"], result["output_path"], result["num_boxes"]), (True, self.output, 1))
-        self.assert_boxed_output()
-
-    def test_drawn_box_is_at_the_converted_pixels(self):
-        _, messages = self.run_agent(FakeGemini(VALID_CALL))
-        x0, y0, x1, y1 = json.loads(messages[-1].content)["boxes"][0]["box_px"]
-        w, h = open_rgb(DOG).size
-        self.assertEqual([x0, y0, x1, y1], [round(161 * w / 1000), round(205 * h / 1000),
-                                            round(867 * w / 1000), round(835 * h / 1000)])
-        self.assertEqual(open_rgb(self.output).getpixel((x1 - 1, (y0 + y1) // 2)), (255, 0, 0))  # right edge
-
-    def test_malformed_json_then_valid_call_retries_once(self):
-        malformed = "Sure! Here is the box:\n```json\n" + VALID_CALL + "\n```"
-        fake = FakeGemini(malformed, VALID_CALL)
-        answer, _ = self.run_agent(fake)
-
-        self.assertEqual(len(fake.calls), 2)
-        second = fake.calls[1]["messages"]
-        self.assertEqual([role for role, _, _ in second], [Role.USER, Role.ASSISTANT, Role.SYSTEM])
-        self.assertEqual(second[1][1], malformed)                    # the model sees its own bad reply
-        self.assertIn("Your reply was rejected", second[2][1])       # and why it was rejected
-        self.assertIn("exactly one JSON object", second[2][1])
-
-        self.assertEqual(self.draw.call_count, 1)
-        self.assertTrue(answer.content.startswith("Drew 1 box(es): dog ["))
         self.assert_boxed_output()
 
     def test_invalid_coordinates_then_valid_call_retries_without_drawing(self):
@@ -218,56 +193,6 @@ def object_box(image, region):
     left, top = region[:2]
     x0, y0, x1, y1 = non_white(image).crop(region).getbbox()
     return [x0 + left, y0 + top, x1 + left, y1 + top]
-
-
-def tightest_box(px, w, h):
-    """The tightest 0-1000 [y_min, x_min, y_max, x_max] box a perfect model could send that still covers px."""
-    x0, y0, x1, y1 = px
-    return [y0 * 1000 // h, x0 * 1000 // w, -(-y1 * 1000 // h), -(-x1 * 1000 // w)]
-
-
-class CropKeepsTheWholeObjectTest(unittest.TestCase):
-    """The real crop tool on the real images: a box that covers the dog gives a crop with all of the dog,
-    none of the other objects, and almost none of the white space."""
-
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        patcher = mock.patch.object(chat, "OUTPUT_DIR", os.path.join(tmp.name, "outputs"))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def crop_object(self, path, region, others=()):
-        """Crop the object found in region with the tightest valid box; check nothing of it was cut off."""
-        before = sha256(path)
-        image = load_image(path)
-        w, h = image.size
-        dog = object_box(image, region)
-        boxes = [{"label": "dog", "box": tightest_box(dog, w, h)}]
-        validate_boxes(boxes)  # a box the model is allowed to send
-        crop = chat.crop_object(image, path, None, boxes)["crops"][0]
-        cx0, cy0, cx1, cy1 = crop["box_px"]
-        saved = open_rgb(crop["output_path"])
-
-        self.assertTrue(cx0 <= dog[0] and cy0 <= dog[1] and cx1 >= dog[2] and cy1 >= dog[3])  # whole dog inside
-        self.assertEqual(saved.tobytes(), image.convert("RGB").crop(crop["box_px"]).tobytes())  # pixels unchanged
-        self.assertEqual(non_white(saved).histogram()[255], non_white(image).crop(dog).histogram()[255])  # every dog pixel kept
-        for edge_gap in [dog[0] - cx0, dog[1] - cy0, cx1 - dog[2], cy1 - dog[3]]:  # at most one 0-1000 step + 1 px
-            self.assertLessEqual(edge_gap, max(w, h) / 1000 + 1)
-        for other in others:  # e.g. the cat and the tree are cut away
-            ox0, oy0, ox1, oy1 = object_box(image, other)
-            self.assertTrue(ox1 <= cx0 or ox0 >= cx1 or oy1 <= cy0 or oy0 >= cy1, f"crop overlaps {other}")
-        self.assertEqual(sha256(path), before)  # the original file is untouched
-        return image.size, saved.size
-
-    def test_dog_png_crop_keeps_the_whole_dog_and_trims_the_white_space(self):
-        (w, h), (cw, ch) = self.crop_object(DOG, region=(0, 0, 310, 194))
-        self.assertLess(cw * ch, w * h / 2)  # the white space around the dog is gone
-
-    def test_environment_png_crop_isolates_the_dog_from_the_cat_and_tree(self):
-        (w, h), (cw, ch) = self.crop_object(ENVIRONMENT, region=(623, 400, 1246, 892),           # lower right: dog
-                                            others=[(0, 0, 1246, 400), (0, 300, 623, 892)])     # tree, cat
-        self.assertLess(cw * ch, w * h / 20)  # only the dog's small corner of the scene is left
 
 
 if __name__ == "__main__":

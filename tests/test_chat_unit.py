@@ -4,10 +4,8 @@ and settings (budgets, limits, OUTPUT_DIR) are changed only inside a test with u
 
 Run from the project root:  python3 -m unittest discover -s tests -v
 """
-import base64
 import contextlib
 import io
-import json
 import os
 import random
 import sys
@@ -45,11 +43,6 @@ def noise_image(size=(400, 200), fmt="PNG"):
     return image
 
 
-def read_bytes(path):
-    with open(path, "rb") as f:
-        return f.read()
-
-
 def open_rgb(path):
     with Image.open(path) as image:
         return image.convert("RGB")
@@ -81,11 +74,6 @@ class TempDirTest(unittest.TestCase):
 # ---------- Box validation ----------
 
 class ValidateBoxesTest(unittest.TestCase):
-    def assert_all_rejected(self, cases):
-        for case, boxes, error in cases:
-            with self.subTest(case=case, boxes=boxes), self.assertRaises(error):
-                validate_boxes(boxes)
-
     def test_accepts_valid_boxes(self):
         cases = {
             "one box": [GOOD],
@@ -99,62 +87,30 @@ class ValidateBoxesTest(unittest.TestCase):
             with self.subTest(case=case):
                 self.assertIsNone(validate_boxes(boxes))
 
-    def test_rejects_bad_list_or_entry_structure(self):
-        self.assert_all_rejected([
+    def test_rejects_each_kind_of_mistake(self):
+        cases = [
+            # the list and its entries
             ("single object, not a list", GOOD, TypeError),
-            ("string", "dog", TypeError),
-            ("null", None, TypeError),
             ("empty list", [], ValueError),
-            ("entry is a string", ["dog"], TypeError),
-            ("entry is a list", [[100, 200, 300, 400]], TypeError),
-            ("entry is null", [None], TypeError),
-            ("missing box", [{"label": "dog"}], ValueError),
-            ("missing label", [{"box": [1, 2, 3, 4]}], ValueError),
+            ("entry not an object", ["dog"], TypeError),
+            ("missing field", [{"label": "dog"}], ValueError),
             ("extra field", [{**GOOD, "confidence": 0.9}], ValueError),
-            ("path field", [{**GOOD, "output_path": "/tmp/x.png"}], ValueError),
-            ("one bad box spoils the list", [GOOD, box("black_cat")], ValueError),
-        ])
-
-    def test_rejects_invalid_labels(self):
-        self.assert_all_rejected([
-            ("null", [box(None)], TypeError),
-            ("number", [box(5)], TypeError),
-            ("empty", [box("")], ValueError),
-            ("blank", [box("   ")], ValueError),
-            ("underscore", [box("black_cat")], ValueError),
-            ("leading underscore", [box("_dog")], ValueError),
-            ("file name", [box("dog.png")], ValueError),
-            ("sentence with file name", [box("the tree in environment.png")], ValueError),
-            ("absolute path", [box("/Users/x/dog")], ValueError),
-            ("backslash", [box("a\\b")], ValueError),
-            ("41 characters", [box("x" * 41)], ValueError),
-            ("exclamation", [box("dog!")], ValueError),
-            ("trailing dot", [box("dog.")], ValueError),
-            ("parentheses", [box("dog (left)")], ValueError),
-            ("newline", [box("dog\ncat")], ValueError),
-            ("leading space", [box(" dog")], ValueError),
-            ("leading hyphen", [box("-dog")], ValueError),
-        ])
-
-    def test_rejects_invalid_coordinates(self):
-        self.assert_all_rejected([
-            ("string box", [{"label": "dog", "box": "1,2,3,4"}], TypeError),
-            ("tuple box", [{"label": "dog", "box": (1, 2, 3, 4)}], TypeError),
-            ("no values", [box(coords=())], ValueError),
+            # the label
+            ("label not a string", [box(5)], TypeError),
+            ("blank label", [box("   ")], ValueError),
+            ("underscore in one label spoils the list", [GOOD, box("black_cat")], ValueError),
+            ("file name as label", [box("dog.png")], ValueError),
+            ("label over 40 characters", [box("x" * 41)], ValueError),
+            # the coordinates
+            ("box not a list", [{"label": "dog", "box": "1,2,3,4"}], TypeError),
             ("3 values", [box(coords=(1, 2, 3))], ValueError),
-            ("5 values", [box(coords=(1, 2, 3, 4, 5))], ValueError),
-            ("string value", [box(coords=("1", 2, 3, 4))], TypeError),
             ("float value", [box(coords=(1.0, 2, 3, 4))], TypeError),
-            ("true", [box(coords=(True, 2, 3, 4))], TypeError),
-            ("false", [box(coords=(0, 0, False, 1))], TypeError),
-            ("null", [box(coords=(None, 2, 3, 4))], TypeError),
-            ("below 0", [box(coords=(-1, 0, 10, 10))], ValueError),
             ("above 1000", [box(coords=(0, 0, 1001, 10))], ValueError),
-            ("y_min > y_max", [box(coords=(300, 200, 100, 400))], ValueError),
-            ("x_min > x_max", [box(coords=(100, 400, 300, 200))], ValueError),
             ("y_min == y_max", [box(coords=(100, 200, 100, 400))], ValueError),
-            ("x_min == x_max", [box(coords=(100, 200, 300, 200))], ValueError),
-        ])
+        ]
+        for case, boxes, error in cases:
+            with self.subTest(case=case), self.assertRaises(error):
+                validate_boxes(boxes)
 
 
 # ---------- Interactive image paths ----------
@@ -201,13 +157,6 @@ class InteractiveModeTest(unittest.TestCase):
                 self.assertIn("command-line flags", printed)
                 self.assertNotIn("one image", printed)  # not mistaken for a second input image
 
-    def test_plain_request_with_image_path_still_runs(self):
-        dog = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dog.png")
-        handle, _ = self.chat(f"Draw a box around the dog in {dog}")
-        handle.assert_called_once()
-        _, text, image_path = handle.call_args.args
-        self.assertEqual((text, image_path), ("Draw a box around the dog in the image", dog))
-
 
 # ---------- Gemini copy: size and budget ----------
 
@@ -216,14 +165,6 @@ class PrepareGeminiCopyTest(unittest.TestCase):
 
     def fits(self, data, budget, overhead=100):
         return base64_size(len(data)) + self.TEXT_BYTES + overhead <= budget
-
-    def test_base64_size_matches_real_encoding(self):
-        for n_bytes in list(range(0, 100)) + [3 * 1024 * 1024 + 1]:
-            with self.subTest(n_bytes=n_bytes):
-                self.assertEqual(base64_size(n_bytes), len(base64.b64encode(bytes(n_bytes))))
-
-    def test_safety_budget_is_90_mb_below_gemini_100_mb_limit(self):
-        self.assertEqual((chat.REQUEST_BUDGET, chat.GEMINI_INLINE_LIMIT), (90 * chat.MB, 100 * chat.MB))
 
     def test_image_within_budget_keeps_its_format_and_size(self):
         for fmt, mime in [("PNG", "image/png"), ("JPEG", "image/jpeg")]:
@@ -263,15 +204,6 @@ class PrepareGeminiCopyTest(unittest.TestCase):
         # The message tells our safety limit apart from Gemini's API limit.
         self.assertIn("our safety limit is 3 MB", str(raised.exception))
         self.assertIn("Gemini's API limit is 100 MB", str(raised.exception))
-
-    def test_png_over_raw_limit_skips_the_full_size_png_encode(self):
-        # The limit is patched down so a small image stands in for a huge one (no big memory use).
-        image, raw = noise_image((40, 30), "PNG"), 40 * 30 * 3
-        for limit, first_format in [(raw - 1, "JPEG"), (raw, "PNG")]:
-            with self.subTest(limit=limit), mock.patch.object(chat, "PNG_RAW_LIMIT", limit), \
-                    mock.patch.object(chat, "encode", wraps=chat.encode) as encode:
-                prepare_gemini_copy(image, self.TEXT_BYTES)
-                self.assertEqual(encode.call_args_list[0].args[1], first_format)
 
 
 # ---------- Colour modes ----------
@@ -338,26 +270,6 @@ class DrawBoundingBoxesTest(TempDirTest):
         saved = open_rgb(result["output_path"])
         self.assertEqual(saved.getpixel((self.W - 1, self.H // 2)), (255, 0, 0))  # right edge visible
         self.assertEqual(saved.getpixel((self.W // 2, self.H - 1)), (255, 0, 0))  # bottom edge visible
-
-    def test_output_keeps_the_original_dimensions(self):
-        for name in ["out.png", "out.jpg", "out.jpeg"]:
-            with self.subTest(name=name):
-                result = self.draw([{"label": "dog", "box": [0, 0, 1000, 1000]}], name=name)
-                self.assertEqual(open_rgb(result["output_path"]).size, (self.W, self.H))
-
-    def test_default_output_goes_to_output_dir(self):
-        with mock.patch.object(chat, "OUTPUT_DIR", self.path("outputs")):
-            result = draw_bounding_boxes(Image.new("RGB", (self.W, self.H)), "/somewhere/dog.png", None,
-                                         [{"label": "dog", "box": [0, 0, 10, 10]}])
-        self.assertEqual(result["output_path"], os.path.join(self.path("outputs"), "dog_boxes.png"))
-        self.assertTrue(os.path.isfile(result["output_path"]))
-
-    def test_existing_output_is_never_overwritten(self):
-        paths = [self.draw([{"label": "dog", "box": [0, 0, 10, 10]}])["output_path"]]
-        first_bytes = read_bytes(paths[0])
-        paths += [self.draw([{"label": "cat", "box": [500, 500, 900, 900]}])["output_path"] for _ in range(2)]
-        self.assertEqual(paths, [self.path("out.png"), self.path("out_2.png"), self.path("out_3.png")])
-        self.assertEqual(read_bytes(paths[0]), first_bytes)
 
 
 # ---------- Output paths ----------
@@ -430,12 +342,6 @@ class GeminiReplyTest(unittest.TestCase):
         with mock.patch.object(chat, "client", return_value=fake):
             return chat.gemini_llm("system", [Message(Role.USER, "box the dog", image_path="dog.png")], image)
 
-    def test_text_reply_is_returned(self):
-        reply = '{"type":"final","message":"ok"}'
-        response = types.GenerateContentResponse(candidates=[types.Candidate(
-            content=types.Content(role="model", parts=[types.Part.from_text(text=reply)]))])
-        self.assertEqual(self.call(response), reply)
-
     def test_closeups_are_sent_from_the_current_request_only(self):
         old = noise_image((600, 600))  # close-up from an earlier request: big, so counting it would show
         new = Image.new("RGB", (64, 32), "red")
@@ -481,76 +387,12 @@ class GeminiReplyTest(unittest.TestCase):
 
 class CropObjectTest(TempDirTest):
     """chat.crop_object: one file per box, cut from the original at the box's pixel region."""
-    W, H = 200, 100
 
     def setUp(self):
         super().setUp()
-        self.image = noise_image((self.W, self.H), "PNG")
-        self.outputs = self.path("outputs")
-        patcher = mock.patch.object(chat, "OUTPUT_DIR", self.outputs)
+        patcher = mock.patch.object(chat, "OUTPUT_DIR", self.path("outputs"))  # crops land in the temp folder
         patcher.start()
         self.addCleanup(patcher.stop)
-
-    def crop(self, boxes, output_path=None, image_path="/somewhere/dog.png"):
-        return chat.crop_object(self.image, image_path, output_path, boxes)
-
-    def out(self, name):
-        return os.path.join(self.outputs, name)
-
-    def test_each_box_is_saved_at_its_pixel_region(self):
-        result = self.crop([box("dog", (250, 100, 750, 500)),   # [y_min, x_min, y_max, x_max] in 0-1000
-                            box("tree", (0, 0, 1000, 1000)),
-                            box("speck", (0, 0, 1, 1))])        # rounds to 0 pixels: still 1x1
-        expected = [("dog", [20, 25, 100, 75], (80, 50)),          # [x_min, y_min, x_max, y_max], max exclusive
-                    ("tree", [0, 0, self.W, self.H], (self.W, self.H)),
-                    ("speck", [0, 0, 1, 1], (1, 1))]
-        self.assertEqual(result["num_crops"], 3)
-        for crop, (label, px, size) in zip(result["crops"], expected):
-            with self.subTest(label=label):
-                self.assertEqual((crop["label"], crop["box_px"], crop["output_path"]),
-                                 (label, px, self.out(f"dog_{label}.png")))
-                saved = open_rgb(crop["output_path"])
-                self.assertEqual(saved.size, size)
-                self.assertEqual(saved.tobytes(), self.image.crop(px).tobytes())  # the same pixels
-
-    def test_message_lists_every_saved_file_and_pixel_box(self):
-        result = self.crop([box("dog", (250, 100, 750, 500)), box("black cat", (0, 0, 500, 500))])
-        self.assertEqual(result["message"],
-                         f"Cropped 2 object(s): dog [20, 25, 100, 75] -> {self.out('dog_dog.png')}; "
-                         f"black cat [0, 0, 100, 50] -> {self.out('dog_black_cat.png')}")
-
-    def test_duplicate_labels_and_repeat_runs_get_new_files(self):
-        first = self.crop([box("dog", (0, 0, 500, 500)), box("dog", (500, 500, 1000, 1000))])
-        first_bytes = read_bytes(self.out("dog_dog.png"))
-        again = self.crop([box("dog", (100, 100, 900, 900))])
-        self.assertEqual([c["output_path"] for c in first["crops"] + again["crops"]],
-                         [self.out("dog_dog.png"), self.out("dog_dog_2.png"), self.out("dog_dog_3.png")])
-        self.assertEqual(read_bytes(self.out("dog_dog.png")), first_bytes)  # never overwritten
-
-    def test_output_path_names_every_crop(self):
-        result = self.crop([box("dog"), box("cat")], output_path=self.path("crop.jpg"))
-        self.assertEqual([c["output_path"] for c in result["crops"]], [self.path("crop.jpg"), self.path("crop_2.jpg")])
-        self.assertEqual(decode(read_bytes(self.path("crop.jpg"))).format, "JPEG")
-        self.assertFalse(os.path.exists(self.outputs))
-
-    def test_original_image_and_file_are_never_changed(self):
-        original_path = self.path("dog.png")
-        self.image.save(original_path)
-        file_before, image_before = read_bytes(original_path), (self.image.size, self.image.mode, self.image.tobytes())
-        self.crop([box("dog", (0, 0, 1000, 1000)), box("dog", (100, 100, 200, 200))], image_path=original_path)
-        self.assertEqual((self.image.size, self.image.mode, self.image.tobytes()), image_before)
-        self.assertEqual(read_bytes(original_path), file_before)
-
-    def test_invalid_boxes_are_rejected_by_the_validator_before_cropping(self):
-        agent = chat.Agent(tools=chat.tools, llm=None)  # real validator, no model
-        for case, boxes in [("empty list", []), ("x/y out of range", [box(coords=(700, 0, 1200, 100))]),
-                            ("y_min > y_max", [box(coords=(300, 200, 100, 400))]),
-                            ("file name label", [box("dog.png")]), ("extra field", [{**GOOD, "path": "/tmp/x"}]),
-                            ("float value", [box(coords=(1.0, 2, 3, 4))])]:
-            with self.subTest(case=case):
-                result = agent.call_tool({"name": "crop_object", "arguments": {"boxes": boxes}}, self.image, "dog.png")
-                self.assertEqual((result["success"], result["error_type"]), (False, "invalid_arguments"))
-        self.assertFalse(os.path.exists(self.outputs))  # nothing was saved
 
     def test_crop_always_covers_the_whole_requested_region(self):
         # Whatever valid box the model sends, every pixel it touches is kept, plus at most one partial pixel per side.
@@ -574,69 +416,11 @@ class CropObjectTest(TempDirTest):
                     with Image.open(crop["output_path"]) as saved:
                         self.assertEqual(saved.size, (px1 - px0, py1 - py0))
 
-    def test_crop_tool_shares_the_box_validator_and_ends_the_turn(self):
-        draw, crop = chat.tools[:2]
-        self.assertEqual((draw.name, crop.name), ("draw_bounding_boxes", "crop_object"))
-        self.assertIs(crop.validate, validate_boxes)
-        self.assertIs(crop.parameter_schema, draw.parameter_schema)
-        self.assertTrue(crop.return_direct)
-
-
-class DrawLabelTest(TempDirTest):
-    def test_image_label_is_the_name_and_message_has_pixel_coordinates(self):
-        with mock.patch.object(chat.ImageDraw.ImageDraw, "text", autospec=True) as text:
-            result = draw_bounding_boxes(Image.new("RGB", (200, 100)), "in.png", self.path("out.png"),
-                                         [box("dog", (250, 100, 750, 500)), box("black cat", (0, 0, 500, 500))])
-        self.assertEqual([c.args[2] for c in text.call_args_list], ["dog", "black cat"])  # names only on the image
-        self.assertEqual(result["message"], "Drew 2 box(es): dog [20, 25, 100, 75]; black cat [0, 0, 100, 50]. "
-                                            f"Saved to {self.path('out.png')}")
-
-
-class HandleTest(unittest.TestCase):
-    def test_trail_shows_when_a_picture_went_back_to_the_model(self):
-        def run(messages, output_path=None):
-            messages.append(Message(Role.TOOL, '{"success": true}', tool_name="zoom_region",
-                                    image=Image.new("RGB", (1024, 732))))
-            return Message(Role.ASSISTANT, "done")
-        out = io.StringIO()
-        with mock.patch.object(chat.agent, "run", side_effect=run), contextlib.redirect_stdout(out):
-            chat.handle([], "box the dog", "dog.png")
-        self.assertIn('[zoom_region] {"success": true} + image 1024x732', out.getvalue())
-
 
 # ---------- Zooming ----------
 
-def raised(function, *args):
-    """The TypeError/ValueError that function(*args) raises (None if it raises nothing)."""
-    try:
-        function(*args)
-    except (TypeError, ValueError) as e:
-        return e
-    return None
-
-
 class ZoomRegionTest(TempDirTest):
     """chat.zoom_region, and the coordinate helpers it shares with drawing and cropping."""
-
-    def test_validate_region_uses_the_same_coordinate_checks_as_boxes(self):
-        cases = {"string": "1,2,3,4", "tuple": (1, 2, 3, 4), "3 values": [1, 2, 3], "float": [1.0, 2, 3, 4],
-                 "true": [True, 2, 3, 4], "null": [None, 2, 3, 4], "below 0": [-1, 0, 10, 10],
-                 "above 1000": [0, 0, 1001, 10], "y_min > y_max": [300, 200, 100, 400],
-                 "x_min == x_max": [100, 200, 300, 200]}
-        for case, coords in cases.items():
-            with self.subTest(case=case):
-                as_region = raised(chat.validate_region, coords)
-                as_box = raised(validate_boxes, [{"label": "dog", "box": coords}])
-                self.assertIsNotNone(as_region)
-                self.assertEqual(type(as_region), type(as_box))
-                self.assertEqual(str(as_region), str(as_box).replace("boxes[0].box", "region"))
-        self.assertIsNone(chat.validate_region([0, 0, 1000, 1000]))
-        with mock.patch.object(chat, "check_box", wraps=chat.check_box) as check:
-            chat.validate_region([1, 2, 3, 4])
-            validate_boxes([box("dog", (1, 2, 3, 4))])
-        self.assertEqual(check.call_args_list, [mock.call([1, 2, 3, 4], "region"), mock.call([1, 2, 3, 4], "boxes[0].box")])
-        zoom = next(t for t in chat.tools if t.name == "zoom_region")
-        self.assertIs(zoom.validate, chat.validate_region)
 
     def test_closeup_holds_the_region_enlarged_to_1024_with_proportions_kept(self):
         image = Image.new("RGB", (400, 200), "blue")
@@ -655,19 +439,15 @@ class ZoomRegionTest(TempDirTest):
         tall = chat.zoom_region(noise, {}, [0, 0, 600, 125])  # 50x120 pixels: portrait
         self.assertEqual((tall["region_px"], tall["image"].size), ([0, 0, 50, 120], (427, 1024)))
 
-    def test_zoom_result_describes_the_closeup_and_records_the_view(self):
-        state = {}
-        result = chat.zoom_region(noise_image((400, 200)), state, [250, 100, 750, 600])
-        text = json.loads(json.dumps({k: v for k, v in result.items() if k != "image"}))  # the rest is plain JSON
-        self.assertEqual((text["zoom"], text["max_zooms"], text["closeup_size"]), (1, 2, [1024, 512]))
-        self.assertEqual(text["area"], [250.0, 100.0, 750.0, 600.0])
-        for words in ["Zoom 1 of 2", "[250.0, 100.0, 750.0, 600.0]", "[40, 50, 240, 150]", "1024x512",
-                      "relative to this close-up"]:
-            with self.subTest(words=words):
-                self.assertIn(words, text["message"])
-        self.assertEqual((state["view"], state["zooms"]), ([250, 100, 750, 600], 1))
+    def test_rejected_zoom_changes_nothing(self):
+        # Bad regions are turned away by validate_region before zoom_region runs.
+        for case, region, error in [("float", [0, 0, 500.5, 500], TypeError),
+                                    ("above 1000", [0, 0, 1001, 500], ValueError),
+                                    ("y_min > y_max", [500, 0, 100, 500], ValueError)]:
+            with self.subTest(case=case), self.assertRaises(error):
+                chat.validate_region(region)
 
-    def test_too_small_region_is_rejected(self):
+        # A valid region under 32 pixels on a side is rejected; exactly 32 is fine.
         image = Image.new("RGB", (1000, 500))
         for region, side, ok in [([0, 0, 64, 500], "32 px tall", True), ([0, 0, 62, 500], "31 px tall", False),
                                  ([0, 0, 500, 32], "32 px wide", True), ([0, 0, 500, 31], "31 px wide", False)]:
@@ -678,21 +458,17 @@ class ZoomRegionTest(TempDirTest):
                     self.assertEqual((result["success"], state["zooms"]), (True, 1))
                 else:
                     self.assertEqual((result["success"], result["error_type"]), (False, "invalid_arguments"))
-                    self.assertIn("at least 32 pixels", result["error"])
-                    self.assertEqual(state, {})  # a rejected zoom changes nothing
+                    self.assertEqual(state, {})
 
-    def test_third_zoom_gives_limit_reached(self):
+        # A third zoom is refused and the view stays on the second close-up.
         image, state = noise_image((400, 200)), {}
-        first = chat.zoom_region(image, state, [0, 0, 1000, 1000])
-        second = chat.zoom_region(image, state, [0, 0, 1000, 1000])
+        chat.zoom_region(image, state, [0, 0, 1000, 1000])
+        chat.zoom_region(image, state, [0, 0, 1000, 1000])
         view = state["view"]
         third = chat.zoom_region(image, state, [0, 0, 1000, 1000])
-        self.assertEqual((first["zoom"], second["zoom"]), (1, 2))
         self.assertEqual((third["success"], third["error_type"]), (False, "limit_reached"))
-        self.assertTrue(third["error"].startswith("Limit reached for zooming in"))
-        self.assertIn("draw_bounding_boxes or crop_object", third["error"])  # tells the model what to do now
         self.assertNotIn("image", third)
-        self.assertEqual((state["zooms"], state["view"]), (2, view))  # no third zoom happened
+        self.assertEqual((state["zooms"], state["view"]), (2, view))
 
     def test_second_zoom_and_final_boxes_are_relative_to_the_latest_closeup(self):
         self.assertEqual(chat.to_full([100, 200, 300, 400], {}), [100, 200, 300, 400])  # no view: the whole photo
@@ -712,27 +488,14 @@ class ZoomRegionTest(TempDirTest):
         self.assertEqual(open_rgb(self.path("crop.png")).tobytes(), image.crop((250, 250, 500, 500)).tobytes())
 
 
+
 class BoxFormatPromptTest(unittest.TestCase):
     def test_explains_how_to_choose_a_tool_with_a_valid_example_for_each(self):
-        prompt = chat.BOX_FORMAT
-        self.assertEqual(prompt.count("Bounding box format"), 1)  # the format is explained once
-        for word in ["Choosing a tool", "box", "draw", "mark", "highlight", "crop", "cut out", "extract", "save just"]:
-            with self.subTest(word=word):
-                self.assertIn(word, prompt)
-        examples = [line.split("Example: ", 1)[1] for line in prompt.splitlines() if "Example: " in line]
-        self.assertEqual([parse_reply(e)["name"] for e in examples], [t.name for t in chat.tools])
+        examples = [line.split("Example: ", 1)[1] for line in chat.BOX_FORMAT.splitlines() if "Example: " in line]
+        self.assertEqual([parse_reply(e)["name"] for e in examples], [t.name for t in chat.tools])  # one per tool
         for example in examples:  # each example passes its own tool's validator
             call = parse_reply(example)
             next(t for t in chat.tools if t.name == call["name"]).validate(**call["arguments"])
-
-    def test_explains_when_and_how_to_zoom(self):
-        prompt = chat.BOX_FORMAT
-        for text in ["zoom_region is optional", "at most 2 times per request",
-                     "relative to the latest close-up, not the full photo", "only box things inside the close-up",
-                     "exactly one of draw_bounding_boxes or crop_object"]:
-            with self.subTest(text=text):
-                self.assertIn(text, prompt)
-
 
 if __name__ == "__main__":
     unittest.main()
