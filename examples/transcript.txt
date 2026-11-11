@@ -1,0 +1,6 @@
+  [assistant] {"type":"tool_call","name":"draw_bounding_boxes","arguments":{"boxes":[{"label":"dog","box":[202,158,835,868]}]}}
+  [draw_bounding_boxes] {"success": true, "output_path": "outputs/dog_boxes.png", "num_boxes": 1, "boxes": [{"label": "dog", "box_px": [49, 39, 269, 162]}], "message": "Drew 1 box(es): dog [49, 39, 269, 162]. Saved to outputs/dog_boxes.png"}
+AI: Drew 1 box(es): dog [49, 39, 269, 162]. Saved to outputs/dog_boxes.png
+  [assistant] {"type":"tool_call","name":"draw_bounding_boxes","arguments":{"boxes":[{"label":"cat","box":[458,133,652,250]},{"label":"dog","box":[671,660,810,838]}]}}
+  [draw_bounding_boxes] {"success": true, "output_path": "outputs/environment_boxes.png", "num_boxes": 2, "boxes": [{"label": "cat", "box_px": [166, 409, 312, 582]}, {"label": "dog", "box_px": [822, 599, 1044, 723]}], "message": "Drew 2 box(es): cat [166, 409, 312, 582]; dog [822, 599, 1044, 723]. Saved to outputs/environment_boxes.png"}
+AI: Drew 2 box(es): cat [166, 409, 312, 582]; dog [822, 599, 1044, 723]. Saved to outputs/environment_boxes.png

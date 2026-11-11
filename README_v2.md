@@ -141,6 +141,29 @@ Tool(name, description, parameter_schema, function, validate=None, return_direct
 - `return_direct=True` (the default): a successful result is the answer and ends the turn. `False`: the result goes back to the model, which calls another tool or answers. Successful calls never use up `max_attempts`; `max_steps` caps the total model calls.
 - Bad definitions (empty or non-string names, non-dict schema, non-callable function) and duplicate tool names fail at startup, before any API call.
 
+## Design considerations
+
+**1. The agent doesn't have all the information it needs to answer the query.**
+It asks or says so instead of guessing. The protocol gives the model a second way to reply besides calling a tool: `{"type":"final","message":...}`. If the user doesn't say which object to box, the model replies with a `final` that asks which one. If the object isn't in the photo, it replies "The dog was not found." and nothing is drawn. Missing input that Python can detect is caught before Gemini is called. With no image, or an image that doesn't exist or isn't a JPEG/PNG, the agent answers without making any model call. A follow-up with no image named reuses the last image in the chat.
+
+**2. The agent doesn't have the parameters it needs to call a tool.**
+The call is rejected before the tool runs, and the model is told exactly what was wrong. Every argument in a tool's schema is required, and no extra ones are allowed. Each tool also has a `validate` function that checks the values (whole numbers from 0 to 1000, `min < max`, plain labels). A call with a missing, extra or bad argument gets back a structured error (`missing_arguments`, `unexpected_arguments`, `invalid_arguments`) with the reason, and the model gets another try. Arguments the model can't know, such as the image, file paths and the output location, never come from the model. Python passes them in to the tools that ask for them.
+
+**3. How the agent decides which tool to call.**
+The model decides, based on the system prompt. It lists every tool with its description, its argument schema, and a "Choosing a tool" section with a valid example call for each tool: box/draw/mark means `draw_bounding_boxes`, crop/cut out/extract means `crop_object`, and `zoom_region` only when the object is small or the scene is cluttered. If no tool fits, the model answers with `final` and says what it can do. Python checks that the chosen tool exists, and an unknown name is sent back as `unknown_tool`.
+
+**4. How the agent decides when to stop calling tools.**
+Each tool says whether its result ends the turn (`return_direct`). A successful `draw_bounding_boxes` or `crop_object` ends it right away, and the tool's message ("Drew 1 box(es): dog [50, 40, 269, 162]. Saved to ...") is the answer, so no extra API call is spent on a summary. `zoom_region` doesn't end the turn: its close-up goes back to the model, which then draws, crops or zooms once more. A `final` reply also ends the turn. Hard limits keep a confused model from running forever: at most 6 model calls and 3 fixable mistakes per request, and at most 2 zooms.
+
+**5. How the agent handles errors from tool calls.**
+Errors are sorted by whether the model can fix them.
+- *Fixable* (malformed JSON, unknown tool, missing, extra or invalid arguments, zoom limit reached): the error goes back to the model as a tool message, and it gets another try. Up to 3 mistakes are allowed.
+- *Not fixable* (the tool crashed, a disk or output path error, an empty or blocked response): the run stops at once with a clear message, because asking the model again can't help.
+- *API failures*: timeouts, 429 and 5xx get one quick retry. A bad key, an unknown model, or a 400/403 stops with a specific explanation of what to do next.
+
+**6. How the agent handles the response from tool calls.**
+Every tool returns a dict with `success`, a short `message`, and data such as the pixel boxes and output paths. The agent stores it as a `TOOL` message (tagged with the tool's name) in the conversation, so the full trail of requests and results can be printed and tested. If the tool's result ends the turn, its message becomes the answer. If not, the result is sent back to the model. An image a tool returns, such as a zoom close-up, is taken out of the JSON and attached to the message, so Gemini sees the actual picture rather than text describing it.
+
 ## Design decisions
 
 **Strict parsing, no rescue.** `parse_reply` runs `json.loads` on the whole reply. Prose around the JSON, code fences, several objects, duplicate keys, `NaN`/`Infinity`, and missing or extra fields are all rejected. The model gets one clear correction message instead of the parser guessing at what it meant. The system prompt also tells it explicitly not to use code fences.
