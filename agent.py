@@ -21,12 +21,15 @@ class Message:
     content: str                     # assistant: one JSON object; tool: JSON result
     image_path: Optional[str] = None
     tool_name: Optional[str] = None  # tool that produced this message (Role.TOOL only)
+    image: Optional[Image.Image] = None  # picture a tool returned, e.g. a close-up (Role.TOOL only; JSON can't hold it)
 
     def __post_init__(self):
         if self.role == Role.TOOL and not (self.tool_name or "").strip():
             raise ValueError("a tool message needs a non-empty tool_name")
         if self.role != Role.TOOL and self.tool_name is not None:
             raise ValueError("only tool messages have a tool_name")
+        if self.role != Role.TOOL and self.image is not None:
+            raise ValueError("only tool messages have an image")
 
 
 @dataclass
@@ -34,13 +37,16 @@ class Tool:
     name: str
     description: str
     parameter_schema: Dict[str, Any]         # argument name -> expected shape (shown to the model); all required, no others allowed
-    function: Callable[..., Dict[str, Any]]  # called with **arguments, plus whichever of original_image=, image_path=, output_path= it takes
+    function: Callable[..., Dict[str, Any]]  # called with **arguments, plus whichever of original_image=, image_path=, output_path=, state= it takes
     validate: Optional[Callable[..., None]] = None  # validate(**arguments): raises TypeError/ValueError on bad values
+    return_direct: bool = True  # True: success ends the turn. False: the model sees the result and continues.
 
     def __post_init__(self):
         """Reject bad tool definitions at startup, before any model call."""
         if not isinstance(self.name, str) or not isinstance(self.description, str):
             raise TypeError("tool name and description must be strings")
+        if not isinstance(self.return_direct, bool):
+            raise TypeError(f"tool {self.name!r}: return_direct must be True or False")
         if not isinstance(self.parameter_schema, dict):
             raise TypeError(f"tool {self.name!r}: parameter_schema must be a dict")
         if not callable(self.function):
@@ -57,6 +63,7 @@ class Tool:
 # Kept separate so the agent can be tested with a fake model and no API calls.
 # The provider may send the model a smaller copy, but must never change original_image:
 # boxes are drawn on the full-quality original. Exceptions it raises stop the run.
+# A tool message may carry an image (Message.image); how it is sent is up to the provider.
 LLM = Callable[[str, List[Message], Image.Image], str]
 
 
@@ -137,13 +144,15 @@ Example: {{"type":"final","message":"The dog was not found."}}
 Tools:
 {tools}
 
-If a tool result reports an error, fix the arguments and call the tool again."""
+If a tool result reports an error, fix the arguments and call the tool again.
+If a tool result succeeds, call another tool if one is still needed, otherwise reply with a final answer."""
 
 
 # ---------- Agent ----------
 
 class Agent:
-    def __init__(self, tools: List[Tool], llm: LLM, instructions: str = "", max_attempts: int = 3):
+    def __init__(self, tools: List[Tool], llm: LLM, instructions: str = "", max_attempts: int = 3,
+                 max_steps: int = 6):
         self.tools: Dict[str, Tool] = {}
         for tool in tools:
             if not isinstance(tool, Tool):
@@ -152,7 +161,8 @@ class Agent:
                 raise ValueError(f"duplicate tool name: {tool.name!r}")
             self.tools[tool.name] = tool
         self.llm = llm
-        self.max_attempts = max_attempts
+        self.max_attempts = max_attempts  # failed replies/calls the model may fix per run
+        self.max_steps = max_steps        # model calls per run, successful or not (stops a looping model)
         listing = "\n".join(f"- {t.name}: {t.description}\n  arguments: {json.dumps(t.parameter_schema)}"
                             for t in self.tools.values())
         self.system_prompt = PROTOCOL.format(tools=listing) + (f"\n\n{instructions}" if instructions else "")
@@ -173,8 +183,11 @@ class Agent:
             return Message(Role.ASSISTANT, f"Can't use that image: {e}")
 
         # 2. Ask the model (whole conversation), parse, run the tool. Bad JSON or bad arguments use
-        #    another model attempt; any other error stops (see MODEL_FIXABLE).
-        for _ in range(self.max_attempts):
+        #    one of max_attempts; any other error stops (see MODEL_FIXABLE). Successful calls use no
+        #    attempt, but every model call counts toward max_steps.
+        failures = 0
+        state: Dict[str, Any] = {}  # this request's notepad, shared by its tool calls; never sent to the model
+        for _ in range(self.max_steps):
             reply = self.llm(self.system_prompt, messages, original_image)
             if not reply.strip():
                 # Nothing to correct (e.g. a blocked response): retrying would only repeat it.
@@ -185,24 +198,32 @@ class Agent:
             except ValueError as e:
                 messages.append(Message(Role.SYSTEM, f"Your reply was rejected: {e}. Reply with exactly one JSON object, "
                                                      "with no code fences and no other text."))
-                continue
-            if call["type"] == "final":
-                return Message(Role.ASSISTANT, call["message"])
+            else:
+                if call["type"] == "final":
+                    return Message(Role.ASSISTANT, call["message"])
 
-            result = self.call_tool(call, original_image, image_path, output_path)
-            messages.append(Message(Role.TOOL, json.dumps(result), tool_name=call["name"]))
-            if result.get("success"):
-                # Success ends the turn; the result is not sent back to the model (saves an API call).
-                return Message(Role.ASSISTANT, result.get("message") or json.dumps(result))
-            if result.get("error_type") not in MODEL_FIXABLE:
-                # e.g. a disk or output-path error: another model attempt can't fix it, so stop now.
-                return Message(Role.ASSISTANT, f"Stopped [{result.get('error_type')}]: {result.get('error')}")
+                result = self.call_tool(call, original_image, image_path, output_path, state)
+                image = result.pop("image", None)  # a picture can't go in JSON text: it rides on the message
+                messages.append(Message(Role.TOOL, json.dumps(result), tool_name=call["name"], image=image))
+                if result.get("success"):
+                    if self.tools[call["name"]].return_direct:
+                        # The result is the answer; no extra model call to restate it.
+                        return Message(Role.ASSISTANT, result.get("message") or json.dumps(result))
+                    continue  # the model sees the result next call and picks another tool or a final answer
+                if result.get("error_type") not in MODEL_FIXABLE:
+                    # e.g. a disk or output-path error: another model attempt can't fix it, so stop now.
+                    return Message(Role.ASSISTANT, f"Stopped [{result.get('error_type')}]: {result.get('error')}")
 
-        return Message(Role.ASSISTANT,
-                       f"Gave up after {self.max_attempts} attempts. Last error: {messages[-1].content}")
+            failures += 1
+            if failures >= self.max_attempts:
+                return Message(Role.ASSISTANT,
+                               f"Gave up after {self.max_attempts} attempts. Last error: {messages[-1].content}")
+
+        return Message(Role.ASSISTANT, f"Stopped [max_steps]: reached the limit of {self.max_steps} model calls "
+                                       "in one request without a final answer.")
 
     def call_tool(self, call: Dict[str, Any], original_image: Image.Image, image_path: str,
-                  output_path: Optional[str] = None) -> Dict[str, Any]:
+                  output_path: Optional[str] = None, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Check the model's arguments, then run the tool. The tool function runs only if every check passes.
         Never raises: problems come back as tool_error(...) for the model to fix."""
         tool = self.tools.get(call["name"])
@@ -212,7 +233,8 @@ class Agent:
         # From Python, never the model. Only the ones the function takes, so non-image tools work too.
         accepted = inspect.signature(tool.function).parameters
         context = {k: v for k, v in {"original_image": original_image, "image_path": image_path,
-                                     "output_path": output_path}.items() if k in accepted}
+                                     "output_path": output_path, "state": {} if state is None else state}.items()
+                   if k in accepted}
 
         # 1. Exactly the declared arguments: none missing, nothing extra (e.g. a path or image from the model).
         missing = [p for p in tool.parameter_schema if p not in arguments]
@@ -238,8 +260,9 @@ class Agent:
 
 
 # Tool errors the model can fix by sending a corrected call (each fix uses one model attempt).
+# limit_reached: e.g. no zooms left; the model can still finish with another tool.
 # Anything else (tool_failed: disk, output path, a bug in the tool) stops the run at once.
-MODEL_FIXABLE = {"unknown_tool", "missing_arguments", "unexpected_arguments", "invalid_arguments"}
+MODEL_FIXABLE = {"unknown_tool", "missing_arguments", "unexpected_arguments", "invalid_arguments", "limit_reached"}
 
 
 def tool_error(error_type: str, message: str) -> Dict[str, Any]:

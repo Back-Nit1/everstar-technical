@@ -4,15 +4,16 @@ import os
 import re
 import shlex
 import sys
+from fractions import Fraction
 from functools import cache
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
 
-from agent import Agent, Message, Role, Tool
+from agent import Agent, Message, Role, Tool, tool_error
 
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 TIMEOUT_SECONDS = 30
@@ -30,7 +31,8 @@ USAGE = """Usage (flags are the preferred way):
   --prompt  what to box
   --output  where to save the boxed image (.png, .jpg or .jpeg). Optional: by default it is saved
             as outputs/<name>_boxes.png. If the file already exists, _2, _3, ... is added to the
-            name, so earlier results are never overwritten. The original image is never changed."""
+            name, so earlier results are never overwritten. The original image is never changed.
+            Crops ("Crop the dog") are saved as outputs/<name>_<label>.png, or numbered from --output."""
 
 BANNER = f"""Bounding box agent ({MODEL})
 
@@ -41,6 +43,7 @@ You are now in interactive chat. At the You: prompt, write ONE plain line with w
 + the image path (.png, .jpg or .jpeg). Flags like --image do not work here.
   Examples: Draw a box around the dog in dog.png
             Box the cat and the dog in environment.png
+            Crop the dog out of dog.png          (saves the dog as its own image)
             Is there a car in environment.png?   (no box if it isn't there)
 Type 'exit' to quit.
 """
@@ -51,18 +54,29 @@ def uses_cli_flags(text: str) -> bool:
     """True if the line contains --image, --prompt or --output (also as --output=x.png)."""
     return any(word.split("=")[0] in CLI_FLAGS for word in text.split())
 
-BOX_FORMAT = """Bounding box format (strict):
+BOX_FORMAT = """draw_bounding_boxes and crop_object take the same "boxes" argument; zoom_region's "region" uses the same [y_min, x_min, y_max, x_max] format.
+
+Bounding box format (strict):
 - "box" is [y_min, x_min, y_max, x_max]: y first, then x.
 - Integers from 0 to 1000, normalized to the image: y relative to height, x relative to width. (0, 0) is the top-left corner. Never pixel values.
 - y_min < y_max and x_min < x_max.
-- Box only the objects the user names; never box anything else. If the user does not say which object to box, reply with type "final" asking which object.
+- Include only the objects the user names; never anything else. If the user does not say which object, reply with type "final" asking which object.
 - Box tightly around the whole visible object. One box per object; if the user asks for several objects or "all" of something, box each one.
 - "label" is only the object's name, e.g. "dog" or "black cat": letters, digits, spaces, - and ' only, at most 40 characters. Never put a file name, path, extension or the user's sentence in a label.
 - "boxes" always holds at least one box. If the requested object is not in the image, reply with type "final" and say so instead.
 - Only send labels and coordinates. Never send file paths or anything else.
 
-Example:
-{"type":"tool_call","name":"draw_bounding_boxes","arguments":{"boxes":[{"label":"dog","box":[630,680,815,895]}]}}"""
+Choosing a tool:
+- draw_bounding_boxes: the user asks to box, draw, mark or highlight objects. Saves one copy of the image with labeled boxes.
+  Example: {"type":"tool_call","name":"draw_bounding_boxes","arguments":{"boxes":[{"label":"dog","box":[630,680,815,895]}]}}
+- crop_object: the user asks to crop, cut out, extract or save just the object(s). Saves each box as its own image file.
+  Example: {"type":"tool_call","name":"crop_object","arguments":{"boxes":[{"label":"dog","box":[630,680,815,895]}]}}
+- zoom_region is optional. Use it first only when it really helps: the object is very small or hard to see, or the scene is very cluttered, AND every object the user asks for fits inside one area. It cuts that area out of the full-quality photo, enlarges it, and shows you the close-up. It saves nothing.
+  Example: {"type":"tool_call","name":"zoom_region","arguments":{"region":[550,600,900,950]}}
+- You can zoom at most 2 times per request.
+- After a zoom, every coordinate you send (boxes, or the region of a second zoom) is 0-1000 relative to the latest close-up, not the full photo. Python converts it back to the full photo; never do that math yourself.
+- After a zoom you can only box things inside the close-up, so only zoom when every object the user asks for fits in that area.
+- One tool per request: finish by calling exactly one of draw_bounding_boxes or crop_object. If the request fits neither tool, reply with type "final" and say what you can do."""
 
 
 # ---------- Tool ----------
@@ -70,8 +84,25 @@ Example:
 # A plain name: letters/digits ([^\W_] is \w without "_"), inner spaces, - and '. No _, slashes, dots or other symbols.
 LABEL_PATTERN = re.compile(r"[^\W_](?:(?:[^\W_]|[ '-]){0,38}[^\W_])?")
 
+def check_box(box, where: str) -> None:
+    """[y_min, x_min, y_max, x_max]: exactly 4 whole numbers from 0 to 1000, y_min < y_max and x_min < x_max.
+    Shared by validate_boxes and validate_region. `where` names the value in the error, e.g. "boxes[0].box"."""
+    if not isinstance(box, list):
+        raise TypeError(f"{where} must be a list [y_min, x_min, y_max, x_max], got {type(box).__name__}")
+    if len(box) != 4:
+        raise ValueError(f"{where} must have exactly 4 values [y_min, x_min, y_max, x_max], got {len(box)}")
+    not_whole = [v for v in box if type(v) is not int]  # rejects decimals, true/false, null, strings
+    if not_whole:
+        raise TypeError(f"{where} values must be whole numbers, got {not_whole}")
+    if not all(0 <= v <= 1000 for v in box):
+        raise ValueError(f"{where} values must be between 0 and 1000, got {box}")
+    y_min, x_min, y_max, x_max = box
+    if not (y_min < y_max and x_min < x_max):
+        raise ValueError(f"{where} needs y_min < y_max and x_min < x_max, got {box}")
+
+
 def validate_boxes(boxes) -> None:
-    """Checked by the agent before draw_bounding_boxes runs. Messages go back to the model to fix its next try."""
+    """Checked by the agent before draw_bounding_boxes or crop_object runs. Messages go back to the model to fix its next try."""
     if not isinstance(boxes, list):
         raise TypeError(f"'boxes' must be a list, got {type(boxes).__name__}")
     if not boxes:
@@ -89,18 +120,12 @@ def validate_boxes(boxes) -> None:
             raise ValueError(f"{where}.label must not be empty")
         if not LABEL_PATTERN.fullmatch(label):  # blocks paths/file names like "environment.png" or "a/b"
             raise ValueError(f"{where}.label must be only the object's name (letters, digits, spaces, - and ' only, at most 40 characters, no file names or paths), got {label!r}")
-        if not isinstance(box, list):
-            raise TypeError(f"{where}.box must be a list [y_min, x_min, y_max, x_max], got {type(box).__name__}")
-        if len(box) != 4:
-            raise ValueError(f"{where}.box must have exactly 4 values [y_min, x_min, y_max, x_max], got {len(box)}")
-        not_whole = [v for v in box if type(v) is not int]  # rejects decimals, true/false, null, strings
-        if not_whole:
-            raise TypeError(f"{where}.box values must be whole numbers, got {not_whole}")
-        if not all(0 <= v <= 1000 for v in box):
-            raise ValueError(f"{where}.box values must be between 0 and 1000, got {box}")
-        y_min, x_min, y_max, x_max = box
-        if not (y_min < y_max and x_min < x_max):
-            raise ValueError(f"{where}.box needs y_min < y_max and x_min < x_max, got {box}")
+        check_box(box, f"{where}.box")
+
+
+def validate_region(region) -> None:
+    """Checked by the agent before zoom_region runs: the same coordinate checks as every box."""
+    check_box(region, "region")
 
 
 def next_free_path(path: str) -> str:
@@ -113,10 +138,35 @@ def next_free_path(path: str) -> str:
     return path
 
 
-def default_output_path(image_path: str) -> str:
-    """outputs/<name>_boxes.png for the given input image."""
+def default_output_path(image_path: str, suffix: str = "boxes") -> str:
+    """outputs/<name>_<suffix>.png for the given input image."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    return os.path.join(OUTPUT_DIR, os.path.splitext(os.path.basename(image_path))[0] + "_boxes.png")
+    return os.path.join(OUTPUT_DIR, f"{os.path.splitext(os.path.basename(image_path))[0]}_{suffix}.png")
+
+
+FULL_VIEW = (0, 0, 1000, 1000)  # no zoom yet: the model sees the whole photo
+
+
+def to_full(box: list, state: Optional[Dict[str, Any]]) -> List[Fraction]:
+    """A [y_min, x_min, y_max, x_max] box measured inside the current view (0-1000 of the latest close-up)
+    -> the same box in full-photo 0-1000 coordinates: view top + y * (view height / 1000), and the same for x.
+    Exact fractions, not rounded: to_pixels (or crop's floor/ceil) rounds once at the end, so nothing is lost."""
+    top, left, bottom, right = (state or {}).get("view", FULL_VIEW)
+    y_scale, x_scale = Fraction(bottom - top, 1000), Fraction(right - left, 1000)
+    y0, x0, y1, x1 = box
+    return [top + y0 * y_scale, left + x0 * x_scale, top + y1 * y_scale, left + x1 * x_scale]
+
+
+def to_pixels(box: list, w: int, h: int) -> List[int]:
+    """[y_min, x_min, y_max, x_max] in 0-1000 -> [x_min, y_min, x_max, y_max] in pixels (1000 maps to w or h)."""
+    y0, x0, y1, x1 = box
+    return [round(x0 * w / 1000), round(y0 * h / 1000), round(x1 * w / 1000), round(y1 * h / 1000)]
+
+
+def save_image(image: Image.Image, path: str) -> None:
+    """Save as PNG or JPEG by the path's extension. JPEG has no alpha channel, so it gets an RGB copy."""
+    fmt = OUTPUT_FORMATS[os.path.splitext(path)[1].lower()]
+    (image.convert("RGB") if fmt == "JPEG" else image).save(path, format=fmt)
 
 
 def check_output(output_path: str, image_path: str) -> None:
@@ -130,9 +180,11 @@ def check_output(output_path: str, image_path: str) -> None:
         raise ValueError("--output must not be the input image (it would be overwritten)")
 
 
-def draw_bounding_boxes(original_image: Image.Image, image_path: str, output_path: Optional[str], boxes: list) -> dict:
+def draw_bounding_boxes(original_image: Image.Image, image_path: str, output_path: Optional[str], boxes: list,
+                        state: Optional[Dict[str, Any]] = None) -> dict:
     """Draw already-validated boxes (see validate_boxes) on a copy of the full-quality original.
     Saves to output_path (or outputs/<name>_boxes.png if None), numbered if that file already exists."""
+    boxes = [{**b, "box": to_full(b["box"], state)} for b in boxes]  # close-up coordinates -> full photo
     out = original_image.convert("RGBA")  # convert() returns a new image; the original is untouched
     w, h = out.size
     draw = ImageDraw.Draw(out)
@@ -140,27 +192,83 @@ def draw_bounding_boxes(original_image: Image.Image, image_path: str, output_pat
     font = ImageFont.load_default(size=max(12, min(w, h) // 25))
     drawn = []
     for b in boxes:
-        label, (y0, x0, y1, x1) = b["label"], b["box"]
-        # 0-1000 -> pixels, clamped to real pixels: 1000 maps to w (or h), but the last pixel is w-1 (or h-1).
-        px = [min(round(x0 * w / 1000), w - 1), min(round(y0 * h / 1000), h - 1),
-              min(round(x1 * w / 1000), w - 1), min(round(y1 * h / 1000), h - 1)]  # [x_min, y_min, x_max, y_max]
+        label = b["label"]
+        # Clamped to real pixels: 1000 maps to w (or h), but the last pixel is w-1 (or h-1).
+        px = [min(v, limit - 1) for v, limit in zip(to_pixels(b["box"], w, h), (w, h, w, h))]
         draw.rectangle(px, outline="red", width=line)
         draw.rectangle(draw.textbbox((px[0], px[1]), label, font=font), fill="red")
         draw.text((px[0], px[1]), label, fill="white", font=font)
         drawn.append({"label": label, "box_px": px})
 
     out_path = next_free_path(output_path or default_output_path(image_path))
-    fmt = OUTPUT_FORMATS[os.path.splitext(out_path)[1].lower()]
-    (out.convert("RGB") if fmt == "JPEG" else out).save(out_path, format=fmt)  # JPEG has no alpha channel
-    labels = ", ".join(d["label"] for d in drawn)
+    save_image(out, out_path)
+    boxes_px = "; ".join(f"{d['label']} {d['box_px']}" for d in drawn)  # pixels [x_min, y_min, x_max, y_max]
     return {"success": True, "output_path": out_path, "num_boxes": len(drawn), "boxes": drawn,
-            "message": f"Drew {len(drawn)} box(es) ({labels}). Saved to {out_path}"}
+            "message": f"Drew {len(drawn)} box(es): {boxes_px}. Saved to {out_path}"}
 
 
-tools = [Tool(
-    name="draw_bounding_boxes",
-    description="Draw labeled bounding boxes on the user's image and save a new copy.",
-    parameter_schema={"boxes": {
+def crop_object(original_image: Image.Image, image_path: str, output_path: Optional[str], boxes: list,
+                state: Optional[Dict[str, Any]] = None) -> dict:
+    """Save each already-validated box (see validate_boxes) as its own image, cut from the full-quality original.
+    Saves to outputs/<name>_<label>.png (or output_path if given), numbered if that file already exists,
+    so duplicate labels and repeat runs give new files."""
+    boxes = [{**b, "box": to_full(b["box"], state)} for b in boxes]  # close-up coordinates -> full photo
+    w, h = original_image.size
+    saved = []
+    for b in boxes:
+        y0, x0, y1, x1 = b["box"]
+        # Round outward (floor the start, ceil the end; -(-a // b) is ceil), so the crop covers the whole
+        # requested region and never trims part of the object. x_max/y_max are exclusive; always at least 1x1.
+        px = [x0 * w // 1000, y0 * h // 1000, -(-x1 * w // 1000), -(-y1 * h // 1000)]
+        out_path = next_free_path(output_path or default_output_path(image_path, b["label"].replace(" ", "_")))
+        save_image(original_image.crop(px).convert("RGBA"), out_path)  # crop() returns a new image
+        saved.append({"label": b["label"], "box_px": px, "output_path": out_path})
+    files = "; ".join(f"{s['label']} {s['box_px']} -> {s['output_path']}" for s in saved)
+    return {"success": True, "num_crops": len(saved), "crops": saved,
+            "message": f"Cropped {len(saved)} object(s): {files}"}
+
+
+ZOOM_LIMIT = 2         # zooms per request
+ZOOM_LONG_SIDE = 1024  # the close-up's longer side, in pixels
+MIN_ZOOM_SIDE = 32     # smaller areas would only enlarge into blur
+
+
+def zoom_region(original_image: Image.Image, state: Dict[str, Any], region: list) -> dict:
+    """Cut an already-validated region (see validate_region) out of the full-quality original and enlarge it,
+    so the model can look closer. The region is relative to the current view, so a second zoom lands inside
+    the first. Records the shown area in state["view"] (full-photo 0-1000) and the count in state["zooms"].
+    The close-up goes back under "image"; the agent moves it onto the tool message. Saves nothing."""
+    zooms = state.get("zooms", 0)
+    if zooms >= ZOOM_LIMIT:
+        return tool_error("limit_reached", f"Limit reached for zooming in ({ZOOM_LIMIT} zooms per request). "
+                                           "Call draw_bounding_boxes or crop_object now, with coordinates "
+                                           "relative to the latest close-up.")
+    top, left, bottom, right = to_full(region, state)
+    w, h = original_image.size
+    # Round outward like crop_object, so the whole requested area is shown.
+    px = [left * w // 1000, top * h // 1000, -(-right * w // 1000), -(-bottom * h // 1000)]
+    pw, ph = px[2] - px[0], px[3] - px[1]
+    if pw < MIN_ZOOM_SIDE or ph < MIN_ZOOM_SIDE:
+        return tool_error("invalid_arguments", f"region is only {pw}x{ph} pixels of the original photo; each side "
+                                               f"must be at least {MIN_ZOOM_SIDE} pixels. Choose a larger region.")
+    scale = ZOOM_LONG_SIDE / max(pw, ph)  # longer side becomes 1024, proportions kept
+    size = (max(1, round(pw * scale)), max(1, round(ph * scale)))
+    closeup = safe_rgb(original_image.crop(px)).resize(size, Image.Resampling.LANCZOS)  # crop() is a new image
+
+    # The view is exactly the area shown (the outward-rounded pixels), so close-up coordinates map back exactly.
+    state["view"] = [Fraction(px[1] * 1000, h), Fraction(px[0] * 1000, w),
+                     Fraction(px[3] * 1000, h), Fraction(px[2] * 1000, w)]
+    state["zooms"] = zooms + 1
+    area = [round(float(v), 1) for v in state["view"]]
+    return {"success": True, "zoom": zooms + 1, "max_zooms": ZOOM_LIMIT, "area": area, "region_px": px,
+            "closeup_size": list(size), "image": closeup,
+            "message": f"Zoom {zooms + 1} of {ZOOM_LIMIT}: the attached close-up shows the area {area} of the full "
+                       f"photo ([y_min, x_min, y_max, x_max], 0-1000), which is pixels {px} of the original, "
+                       f"enlarged to {size[0]}x{size[1]} pixels. Every coordinate you send next (boxes, or "
+                       f"another zoom region) must be 0-1000 relative to this close-up, not the full photo."}
+
+
+BOXES_SCHEMA = {"boxes": {
         "type": "list, at least 1 item",
         "items": {
             "label": "string: object name only, e.g. \"dog\"; letters, digits, spaces, - and ' only, max 40 characters, no file names or paths",
@@ -168,10 +276,23 @@ tools = [Tool(
                    "y_min < y_max, x_min < x_max",
         },
         "rules": "each item has only \"label\" and \"box\"; no decimals, true/false, null or extra fields",
-    }},
-    function=draw_bounding_boxes,
-    validate=validate_boxes,
-)]
+    }}
+
+tools = [
+    Tool(name="draw_bounding_boxes",  # must stay first: tests patch tools[0]
+         description="Draw labeled bounding boxes on the user's image and save a new copy.",
+         parameter_schema=BOXES_SCHEMA, function=draw_bounding_boxes, validate=validate_boxes),
+    Tool(name="crop_object",
+         description="Crop each box out of the user's image and save every crop as its own file.",
+         parameter_schema=BOXES_SCHEMA, function=crop_object, validate=validate_boxes),
+    Tool(name="zoom_region",  # never ends the turn: the model sees the close-up and continues
+         description="Cut an area out of the full-quality photo and enlarge it, to look closer at small "
+                     "or crowded objects. Optional, at most 2 per request. Saves nothing.",
+         parameter_schema={"region": "list of exactly 4 whole numbers [y_min, x_min, y_max, x_max], each 0-1000, "
+                                     "y_min < y_max, x_min < x_max; relative to what you see now "
+                                     "(the full photo, or the latest close-up)"},
+         function=zoom_region, validate=validate_region, return_direct=False),
+]
 
 
 # ---------- Gemini copy of the image ----------
@@ -179,6 +300,7 @@ tools = [Tool(
 #   original image  the user's file on disk; never changed or overwritten
 #   Gemini copy     in memory only, never saved; compressed or shrunk only if the request would be too big
 #   boxed result    a new file in outputs/ (or --output), drawn on the full-quality original
+#   close-up        zoom_region's enlarged cut-out of the original; in memory only, sent with its tool result
 # Boxes are 0-1000 relative to width and height, so a proportionally shrunk copy gives the same boxes.
 
 MB = 1024 * 1024
@@ -306,7 +428,12 @@ def gemini_llm(system_prompt: str, messages: List[Message], original_image: Imag
     # Tool results and rejection notes are sent as user turns, labeled so the model can tell them apart.
     texts = [f"[{m.tool_name or m.role.value} result] {m.content}" if m.role in (Role.TOOL, Role.SYSTEM) else m.content
              for m in messages]
-    text_bytes = len(system_prompt.encode()) + sum(len(t.encode()) for t in texts)
+    # Tool images (close-ups) from the current request only: after the newest user message. Older ones are not resent.
+    last_user = max((i for i, m in enumerate(messages) if m.role == Role.USER), default=-1)
+    closeups = {i: encode(safe_rgb(m.image), "JPEG") for i, m in enumerate(messages)
+                if i > last_user and m.image is not None}
+    text_bytes = (len(system_prompt.encode()) + sum(len(t.encode()) for t in texts)
+                  + sum(base64_size(len(c)) for c in closeups.values()))  # close-ups count toward the budget too
     data, mime_type, size = prepare_gemini_copy(original_image, text_bytes)  # raises before any request if too big
     sent_as = "JPEG" if mime_type == "image/jpeg" else "PNG"
     if size != original_image.size or sent_as != original_image.format:  # only mention a changed copy
@@ -320,6 +447,8 @@ def gemini_llm(system_prompt: str, messages: List[Message], original_image: Imag
     contents = []
     for i, (m, text) in enumerate(zip(messages, texts)):
         parts = [image_part] if i == image_at else []
+        if i in closeups:
+            parts.append(types.Part.from_bytes(data=closeups[i], mime_type="image/jpeg"))
         parts.append(types.Part.from_text(text=text))
         contents.append(types.Content(role="model" if m.role == Role.ASSISTANT else "user", parts=parts))
 
@@ -372,7 +501,8 @@ def handle(messages: List[Message], prompt: str, image_path: Optional[str], outp
         error = explain_api_error(e)
         answer = f"Stopped [{error['error_type']}]: {error['error']}"
     for m in messages[before:]:  # model replies, tool results, retries
-        print(f"  [{m.tool_name or m.role.value}] {m.content}")
+        picture = f" + image {m.image.width}x{m.image.height}" if m.image is not None else ""  # a close-up went to the model
+        print(f"  [{m.tool_name or m.role.value}] {m.content}{picture}")
     # Not added to `messages`: the history already holds the model's JSON reply (see Agent.run).
     print(f"AI: {answer}")
 

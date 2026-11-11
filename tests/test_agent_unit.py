@@ -3,6 +3,7 @@ Image files are made in a temporary folder that is deleted after each test.
 
 Run from the project root:  python3 -m unittest discover -s tests -v
 """
+import json
 import os
 import sys
 import tempfile
@@ -13,14 +14,16 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent import Agent, Message, Role, Tool, load_image, parse_reply  # noqa: E402
+from agent import MODEL_FIXABLE, tool_error  # noqa: E402
 
 FINAL = '{"type":"final","message":"No cat in this image."}'
 CALL = '{"type":"tool_call","name":"echo","arguments":{"text":"hi"}}'
 
 
-def make_tool(name="echo", function=None, validate=None):
+def make_tool(name="echo", function=None, validate=None, return_direct=True):
     return Tool(name=name, description=f"{name} tool", parameter_schema={"text": "string to echo"},
-                function=function or (lambda text: {"success": True, "message": text}), validate=validate)
+                function=function or (lambda text: {"success": True, "message": text}), validate=validate,
+                return_direct=return_direct)
 
 
 def must_be_string(text):
@@ -78,6 +81,14 @@ class MessageTest(unittest.TestCase):
                                      ("Draw a box around the dog", "dog.png", tool_name))
                 else:
                     self.assertRaises(ValueError, make)
+
+    def test_only_tool_messages_carry_an_image(self):
+        image = Image.new("RGB", (4, 4))
+        self.assertIs(Message(Role.TOOL, "{}", tool_name="zoom_region", image=image).image, image)
+        self.assertIsNone(Message(Role.TOOL, "{}", tool_name="echo").image)  # an image is optional
+        for role in [Role.USER, Role.ASSISTANT, Role.SYSTEM]:
+            with self.subTest(role=role), self.assertRaises(ValueError):
+                Message(role, "look at this", image=image)
 
 
 class ToolDefinitionTest(unittest.TestCase):
@@ -208,8 +219,10 @@ class AgentRunTest(TempDirTest):
         super().setUp()
         self.image_path = self.save_image("dog.png")
 
-    def run_agent(self, llm, image_path="default", max_attempts=3, function=None, validate=None):
-        agent = Agent(tools=[make_tool(function=function, validate=validate)], llm=llm, max_attempts=max_attempts)
+    def run_agent(self, llm, image_path="default", max_attempts=3, function=None, validate=None,
+                  return_direct=True, max_steps=4):
+        agent = Agent(tools=[make_tool(function=function, validate=validate, return_direct=return_direct)],
+                      llm=llm, max_attempts=max_attempts, max_steps=max_steps)
         path = self.image_path if image_path == "default" else image_path
         messages = [Message(Role.USER, "box the dog", image_path=path)]
         return agent.run(messages), messages
@@ -270,6 +283,93 @@ class AgentRunTest(TempDirTest):
                 answer, _ = self.run_agent(llm, function=function)
                 self.assertEqual(llm.calls, 1)
                 self.assertTrue(answer.content.startswith(answer_start))
+
+    # ---------- return_direct and max_steps ----------
+
+    def test_return_direct_decides_if_the_model_sees_a_successful_result(self):
+        for return_direct, calls, content, roles in [
+                (True, 1, "hi", [Role.USER, Role.ASSISTANT, Role.TOOL]),  # result is the answer
+                (False, 2, "No cat in this image.",                       # model saw the result, then replied
+                 [Role.USER, Role.ASSISTANT, Role.TOOL, Role.ASSISTANT])]:
+            with self.subTest(return_direct=return_direct):
+                llm = FakeLLM(CALL, FINAL)
+                answer, messages = self.run_agent(llm, return_direct=return_direct)
+                self.assertEqual((llm.calls, answer.content), (calls, content))
+                self.assertEqual([m.role for m in messages], roles)
+                self.assertEqual(messages[2].tool_name, "echo")
+
+    def test_successful_calls_do_not_use_the_retry_budget(self):
+        # One failure allowed, yet three successful calls and a final answer all fit.
+        llm = FakeLLM(CALL, CALL, CALL, FINAL)
+        answer, _ = self.run_agent(llm, max_attempts=1, return_direct=False)
+        self.assertEqual((llm.calls, answer.content), (4, "No cat in this image."))
+        # Failures still count: success, failure, success, failure -> gives up at 2 failures.
+        llm = FakeLLM(CALL, "not json", CALL, "not json")
+        answer, _ = self.run_agent(llm, max_attempts=2, return_direct=False)
+        self.assertEqual(llm.calls, 4)
+        self.assertTrue(answer.content.startswith("Gave up after 2 attempts"))
+
+    def test_looping_model_stops_at_max_steps(self):
+        for max_steps in [1, 4, 6]:
+            with self.subTest(max_steps=max_steps):
+                llm = FakeLLM(*[CALL] * (max_steps + 1))
+                answer, messages = self.run_agent(llm, return_direct=False, max_steps=max_steps)
+                self.assertEqual(llm.calls, max_steps)
+                self.assertEqual(answer.content, f"Stopped [max_steps]: reached the limit of {max_steps} "
+                                                 "model calls in one request without a final answer.")
+                self.assertEqual([m.role for m in messages].count(Role.TOOL), max_steps)
+
+    def test_return_direct_defaults_to_true_and_must_be_a_bool(self):
+        self.assertTrue(make_tool().return_direct)
+        with self.assertRaises(TypeError):
+            make_tool(return_direct="false")
+
+    # ---------- tool images, state, limit_reached ----------
+
+    def test_tool_image_rides_on_the_tool_message_not_in_the_json(self):
+        closeup = Image.new("RGB", (8, 4), "red")
+        llm = FakeLLM(CALL, FINAL)
+        answer, messages = self.run_agent(llm, return_direct=False,
+                                          function=lambda text: {"success": True, "message": text, "image": closeup})
+        tool_message = messages[2]
+        self.assertEqual((tool_message.role, tool_message.tool_name), (Role.TOOL, "echo"))
+        self.assertIs(tool_message.image, closeup)                                       # picture on the message
+        self.assertEqual(json.loads(tool_message.content), {"success": True, "message": "hi"})  # not in the text
+        self.assertEqual([m.image for m in messages if m is not tool_message], [None, None, None])
+        self.assertEqual((llm.calls, answer.content), (2, "No cat in this image."))  # the model saw it and replied
+
+    def test_state_is_shared_within_a_request_and_fresh_for_the_next(self):
+        seen = []  # (the state object, its count right after this call)
+        def count(state, text):
+            state["calls"] = state.get("calls", 0) + 1
+            seen.append((state, state["calls"]))
+            return {"success": True, "calls": state["calls"]}
+        agent = Agent(tools=[make_tool(function=count, return_direct=False)],
+                      llm=FakeLLM(CALL, CALL, FINAL, CALL, FINAL))
+        for _ in range(2):  # two requests, same agent
+            agent.run([Message(Role.USER, "box the dog", image_path=self.image_path)])
+        (first, a), (second, b), (next_request, c) = seen
+        self.assertEqual((a, b, c), (1, 2, 1))
+        self.assertIs(first, second)             # one notepad for both calls of a request
+        self.assertIsNot(first, next_request)    # a new, empty one for the next request
+        # state comes from Python only: the model can't send it as an argument.
+        result = agent.call_tool({"name": "echo", "arguments": {"text": "hi", "state": {}}}, Image.new("RGB", (4, 4)), "x.png")
+        self.assertEqual(result["error_type"], "unexpected_arguments")
+
+    def test_limit_reached_goes_back_to_the_model_for_another_try(self):
+        self.assertIn("limit_reached", MODEL_FIXABLE)
+        results = iter([tool_error("limit_reached", "Limit reached for zooming in"), {"success": True, "message": "drawn"}])
+        llm = FakeLLM(CALL, CALL)
+        answer, messages = self.run_agent(llm, function=lambda text: next(results))
+        self.assertEqual((llm.calls, answer.content), (2, "drawn"))  # the run went on instead of stopping
+        self.assertEqual(json.loads(messages[2].content)["error_type"], "limit_reached")  # the model saw the error
+
+    def test_default_max_steps_is_six(self):
+        self.assertEqual(Agent(tools=[], llm=FakeLLM()).max_steps, 6)
+
+    def test_draw_bounding_boxes_always_returns_direct(self):
+        from chat import tools  # imported here so the rest of this file stays free of chat/Gemini
+        self.assertTrue(next(t for t in tools if t.name == "draw_bounding_boxes").return_direct)
 
 
 # ---------- load_image ----------
