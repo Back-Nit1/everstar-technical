@@ -33,14 +33,23 @@ USAGE = """Usage (flags are the preferred way):
             name, so earlier results are never overwritten. The original image is never changed."""
 
 BANNER = f"""Bounding box agent ({MODEL})
+
+In your normal terminal (not at the You: prompt below):
 {USAGE}
 
-Interactive chat: write ONE line with what to box + the image path (.png, .jpg or .jpeg).
+You are now in interactive chat. At the You: prompt, write ONE plain line with what to box
++ the image path (.png, .jpg or .jpeg). Flags like --image do not work here.
   Examples: Draw a box around the dog in dog.png
             Box the cat and the dog in environment.png
             Is there a car in environment.png?   (no box if it isn't there)
 Type 'exit' to quit.
 """
+CLI_FLAGS = ("--image", "--prompt", "--output")
+
+
+def uses_cli_flags(text: str) -> bool:
+    """True if the line contains --image, --prompt or --output (also as --output=x.png)."""
+    return any(word.split("=")[0] in CLI_FLAGS for word in text.split())
 
 BOX_FORMAT = """Bounding box format (strict):
 - "box" is [y_min, x_min, y_max, x_max]: y first, then x.
@@ -58,7 +67,8 @@ Example:
 
 # ---------- Tool ----------
 
-LABEL_PATTERN = re.compile(r"[^\W_](?:[\w '-]{0,38}[^\W_])?")  # a plain name: no slashes, dots or other symbols
+# A plain name: letters/digits ([^\W_] is \w without "_"), inner spaces, - and '. No _, slashes, dots or other symbols.
+LABEL_PATTERN = re.compile(r"[^\W_](?:(?:[^\W_]|[ '-]){0,38}[^\W_])?")
 
 def validate_boxes(boxes) -> None:
     """Checked by the agent before draw_bounding_boxes runs. Messages go back to the model to fix its next try."""
@@ -131,7 +141,9 @@ def draw_bounding_boxes(original_image: Image.Image, image_path: str, output_pat
     drawn = []
     for b in boxes:
         label, (y0, x0, y1, x1) = b["label"], b["box"]
-        px = [round(x0 * w / 1000), round(y0 * h / 1000), round(x1 * w / 1000), round(y1 * h / 1000)]  # [x_min, y_min, x_max, y_max]
+        # 0-1000 -> pixels, clamped to real pixels: 1000 maps to w (or h), but the last pixel is w-1 (or h-1).
+        px = [min(round(x0 * w / 1000), w - 1), min(round(y0 * h / 1000), h - 1),
+              min(round(x1 * w / 1000), w - 1), min(round(y1 * h / 1000), h - 1)]  # [x_min, y_min, x_max, y_max]
         draw.rectangle(px, outline="red", width=line)
         draw.rectangle(draw.textbbox((px[0], px[1]), label, font=font), fill="red")
         draw.text((px[0], px[1]), label, fill="white", font=font)
@@ -170,15 +182,21 @@ tools = [Tool(
 # Boxes are 0-1000 relative to width and height, so a proportionally shrunk copy gives the same boxes.
 
 MB = 1024 * 1024
-REQUEST_BUDGET = 15 * MB      # our cap for the whole request; Gemini's inline limit is 20 MB
+GEMINI_INLINE_LIMIT = 100 * MB  # Gemini API's hard limit for a request with inline data (raised from 20 MB in Jan 2026)
+REQUEST_BUDGET = 90 * MB      # our local safety limit for the whole request: 10 MB of room below Gemini's limit
 REQUEST_OVERHEAD = 64 * 1024  # JSON field names, roles and other request metadata
 JPEG_QUALITY = 85
 SHRINK_STEP = 0.75            # each resize keeps 75% of width AND height, so proportions stay the same
 MIN_LONG_SIDE = 768           # never shrink the long side below this: stop instead
+PNG_RAW_LIMIT = 50 * MB       # above this many raw RGB bytes, skip the full-size PNG try (slow and memory-heavy)
 
 
 class ImageTooLargeError(ValueError):
     """The image can't fit the request budget without shrinking it too far. Raised before any request."""
+
+
+class EmptyResponseError(RuntimeError):
+    """Gemini answered with no text (e.g. blocked). Stops the run: there is no JSON to correct."""
 
 
 def base64_size(n_bytes: int) -> int:
@@ -209,13 +227,14 @@ def encode(img: Image.Image, fmt: str) -> bytes:
 def prepare_gemini_copy(original_image: Image.Image, text_bytes: int):
     """Image bytes for Gemini, sized so the whole request (base64 image + text + overhead) fits REQUEST_BUDGET.
     The copy is plain RGB (safe_rgb). Then it tries:
-      1. PNG at full size (PNG inputs only: lossless for screenshots and diagrams)
-      2. JPEG at full size (JPEG inputs start here: re-saving a photo as PNG only wastes memory and bytes)
+      1. PNG at full size (PNG inputs up to PNG_RAW_LIMIT only: lossless for screenshots and diagrams)
+      2. JPEG at full size (JPEG and huge PNG inputs start here)
       3. JPEG, shrunk proportionally step by step
     Never crops, stretches or rotates, and never changes original_image. Returns (bytes, mime_type, (w, h))."""
     budget = REQUEST_BUDGET - REQUEST_OVERHEAD - text_bytes
     safe = safe_rgb(original_image)
-    if original_image.format != "JPEG":
+    w, h = safe.size
+    if original_image.format != "JPEG" and w * h * 3 <= PNG_RAW_LIMIT:
         data = encode(safe, "PNG")
         if base64_size(len(data)) <= budget:
             return data, "image/png", safe.size
@@ -230,7 +249,8 @@ def prepare_gemini_copy(original_image: Image.Image, text_bytes: int):
             raise ImageTooLargeError(
                 f"Image is too large: even as a {w}x{h} JPEG the request would be about "
                 f"{(base64_size(len(data)) + text_bytes + REQUEST_OVERHEAD) / MB:.1f} MB "
-                f"(limit {REQUEST_BUDGET / MB:.0f} MB). Use a smaller or simpler image.")
+                f"(our safety limit is {REQUEST_BUDGET / MB:.0f} MB; Gemini's API limit is "
+                f"{GEMINI_INLINE_LIMIT / MB:.0f} MB). Use a smaller or simpler image.")
         copy = safe.resize(smaller, Image.Resampling.LANCZOS)  # always from the full-size copy: one resample
 
 
@@ -261,6 +281,8 @@ def explain_api_error(e: Exception) -> Dict[str, str]:
     name = type(e).__name__
     if isinstance(e, ImageTooLargeError):  # local, before any request
         return {"error_type": "image_too_large", "error": str(e)}
+    if isinstance(e, EmptyResponseError):
+        return {"error_type": "empty_response", "error": str(e)}
     if "Timeout" in name:  # httpx/httpx2 ConnectTimeout, ReadTimeout, ...
         return {"error_type": "timeout", "error": f"Gemini did not answer within {TIMEOUT_SECONDS} seconds ({TRANSPORT_ATTEMPTS} tries). Try again."}
     if name == "ConnectError" or isinstance(e, ConnectionError):
@@ -304,7 +326,16 @@ def gemini_llm(system_prompt: str, messages: List[Message], original_image: Imag
     response = client().models.generate_content(
         model=MODEL, contents=contents,
         config=types.GenerateContentConfig(system_instruction=system_prompt))
-    return response.text or ""
+    if not (response.text or "").strip():
+        feedback, candidates = response.prompt_feedback, response.candidates
+        if feedback and feedback.block_reason:
+            why = f"the request was blocked ({feedback.block_reason})"
+        elif candidates and candidates[0].finish_reason:
+            why = f"the answer stopped with reason {candidates[0].finish_reason}"
+        else:
+            why = "no reason was given"
+        raise EmptyResponseError(f"Gemini returned no text: {why}. Try rephrasing the request or another image.")
+    return response.text
 
 
 agent = Agent(tools=tools, llm=gemini_llm, instructions=BOX_FORMAT)
@@ -312,15 +343,23 @@ agent = Agent(tools=tools, llm=gemini_llm, instructions=BOX_FORMAT)
 
 # ---------- Chat loop ----------
 
-def find_image_path(text: str):
-    """First token in the input that names a .png/.jpg/.jpeg file, whether or not it exists.
-    The caller checks it exists, so a mistyped name is reported instead of reusing an earlier image."""
+def split_image_paths(text: str):
+    """Every token naming a .png/.jpg/.jpeg file (whether or not it exists), and the text for Gemini
+    with each one replaced by "the image", so local paths never reach it. Text without a path is unchanged.
+    The caller checks the file exists, so a mistyped name is reported instead of reusing an earlier image."""
     try:
         tokens = shlex.split(text)  # handles quoted / backslash-escaped paths from drag-and-drop
     except ValueError:              # e.g. an unmatched quote
         tokens = text.split()
-    paths = (os.path.expanduser(t.rstrip("?!.,;:")) for t in tokens)  # "dog.png?" -> "dog.png"
-    return next((p for p in paths if p.lower().endswith(IMAGE_EXTENSIONS)), None)
+    paths, words = [], []
+    for t in tokens:
+        bare = t.rstrip("?!.,;:")  # "dog.png?" -> "dog.png"
+        if bare.lower().endswith(IMAGE_EXTENSIONS):
+            paths.append(os.path.expanduser(bare))
+            words.append("the image" + t[len(bare):])
+        else:
+            words.append(t)
+    return paths, (" ".join(words) if paths else text)
 
 
 def handle(messages: List[Message], prompt: str, image_path: Optional[str], output_path: Optional[str] = None):
@@ -373,11 +412,20 @@ def main():
             break
         if user_input.lower() == "exit":
             break
-        image_path = find_image_path(user_input)
+        if uses_cli_flags(user_input):  # else --output x.png would count as a second image; no model call
+            print("AI: --image, --prompt and --output are command-line flags. Exit and run them from your "
+                  "normal terminal, e.g. python chat.py --image dog.png --prompt \"Draw a box around the dog\". "
+                  "Here, just write: Draw a box around the dog in dog.png")
+            continue
+        paths, text = split_image_paths(user_input)
+        if len(set(paths)) > 1:  # no model call
+            print(f"AI: Please name only one image per message (found {len(set(paths))}).")
+            continue
+        image_path = paths[0] if paths else None
         if image_path and not os.path.isfile(image_path):  # named an image that isn't there: no model call
             print(f"AI: Image not found: {image_path}")
             continue
-        handle(messages, user_input, image_path)  # no image named: reuses the last one (follow-ups)
+        handle(messages, text, image_path)  # no image named: reuses the last one (follow-ups)
 
 
 if __name__ == "__main__":

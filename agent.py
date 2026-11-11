@@ -34,7 +34,7 @@ class Tool:
     name: str
     description: str
     parameter_schema: Dict[str, Any]         # argument name -> expected shape (shown to the model); all required, no others allowed
-    function: Callable[..., Dict[str, Any]]  # called as function(original_image=, image_path=, output_path=, **arguments)
+    function: Callable[..., Dict[str, Any]]  # called with **arguments, plus whichever of original_image=, image_path=, output_path= it takes
     validate: Optional[Callable[..., None]] = None  # validate(**arguments): raises TypeError/ValueError on bad values
 
     def __post_init__(self):
@@ -87,6 +87,11 @@ def _no_duplicate_keys(pairs):
     return dict(pairs)
 
 
+def _reject_constant(name):
+    # Python's json accepts NaN, Infinity and -Infinity; standard JSON does not.
+    raise ValueError(f"{name} is not valid JSON")
+
+
 def _is_final(reply: dict) -> bool:
     return (reply.keys() == {"type", "message"} and reply["type"] == "final"
             and isinstance(reply["message"], str))
@@ -102,8 +107,8 @@ def parse_reply(text: str) -> Dict[str, Any]:
     """Strict: the whole reply must be exactly one JSON object with exactly the expected keys.
     No searching inside prose or code fences; anything else raises ValueError."""
     try:
-        # Fails on prose, markdown fences, more than one object, or duplicate keys.
-        reply = json.loads(text, object_pairs_hook=_no_duplicate_keys)
+        # Fails on prose, markdown fences, more than one object, duplicate keys, or NaN/Infinity.
+        reply = json.loads(text, object_pairs_hook=_no_duplicate_keys, parse_constant=_reject_constant)
     except json.JSONDecodeError as e:
         raise ValueError(f"reply is not a single JSON object ({e})") from None
     if not isinstance(reply, dict):
@@ -171,6 +176,9 @@ class Agent:
         #    another model attempt; any other error stops (see MODEL_FIXABLE).
         for _ in range(self.max_attempts):
             reply = self.llm(self.system_prompt, messages, original_image)
+            if not reply.strip():
+                # Nothing to correct (e.g. a blocked response): retrying would only repeat it.
+                return Message(Role.ASSISTANT, "Stopped [empty_response]: the model returned no text.")
             messages.append(Message(Role.ASSISTANT, reply))
             try:
                 call = parse_reply(reply)
@@ -201,8 +209,10 @@ class Agent:
         if tool is None:
             return tool_error("unknown_tool", f"unknown tool {call['name']!r}; available: {list(self.tools)}")
         arguments = call["arguments"]
-        context = {"original_image": original_image, "image_path": image_path,
-                   "output_path": output_path}  # from Python, never the model
+        # From Python, never the model. Only the ones the function takes, so non-image tools work too.
+        accepted = inspect.signature(tool.function).parameters
+        context = {k: v for k, v in {"original_image": original_image, "image_path": image_path,
+                                     "output_path": output_path}.items() if k in accepted}
 
         # 1. Exactly the declared arguments: none missing, nothing extra (e.g. a path or image from the model).
         missing = [p for p in tool.parameter_schema if p not in arguments]
