@@ -55,9 +55,8 @@ assert len(calls) == 3, calls
 assert calls[2] == [Role.USER, Role.ASSISTANT, Role.SYSTEM, Role.ASSISTANT, Role.TOOL], calls[2]
 assert messages[-1].role == Role.TOOL and messages[-1].tool_name == "draw_bounding_boxes"
 saved = final.content.split("Saved to ")[-1]
-assert saved.startswith("dog_boxes") and os.path.isfile(saved), final.content
-if saved != "dog_boxes.png":
-    os.remove(saved)  # numbered copy made because dog_boxes.png already exists
+assert saved.startswith(os.path.join("outputs", "dog_boxes")) and os.path.isfile(saved), final.content
+os.remove(saved)  # don't leave test output in outputs/
 
 # 2. Gives up after max_attempts.
 llm, calls = fake_llm(['{"type":"tool_call","name":"nope","arguments":{}}'] * 3)

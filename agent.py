@@ -34,7 +34,7 @@ class Tool:
     name: str
     description: str
     parameter_schema: Dict[str, Any]         # argument name -> expected shape (shown to the model); all required, no others allowed
-    function: Callable[..., Dict[str, Any]]  # called as function(image=, image_path=, output_path=, **arguments)
+    function: Callable[..., Dict[str, Any]]  # called as function(original_image=, image_path=, output_path=, **arguments)
     validate: Optional[Callable[..., None]] = None  # validate(**arguments): raises TypeError/ValueError on bad values
 
     def __post_init__(self):
@@ -53,8 +53,10 @@ class Tool:
             raise ValueError(f"tool {self.name!r}: parameter names must be non-empty strings")
 
 
-# Provider = any function (system_prompt, messages, image) -> raw model text.
+# Provider = any function (system_prompt, messages, original_image) -> raw model text.
 # Kept separate so the agent can be tested with a fake model and no API calls.
+# The provider may send the model a smaller copy, but must never change original_image:
+# boxes are drawn on the full-quality original. Exceptions it raises stop the run.
 LLM = Callable[[str, List[Message], Image.Image], str]
 
 
@@ -159,13 +161,14 @@ class Agent:
             return Message(Role.ASSISTANT, "Please give an image, e.g. --image dog.png, "
                                            "or write the request and the image path in one line.")
         try:
-            image = load_image(image_path)
+            original_image = load_image(image_path)  # full quality; tools draw on this
         except Exception as e:
             return Message(Role.ASSISTANT, f"Can't use that image: {e}")
 
-        # 2. Ask the model (whole conversation), parse, run the tool; retry on any error.
+        # 2. Ask the model (whole conversation), parse, run the tool. Bad JSON or bad arguments use
+        #    another model attempt; any other error stops (see MODEL_FIXABLE).
         for _ in range(self.max_attempts):
-            reply = self.llm(self.system_prompt, messages, image)
+            reply = self.llm(self.system_prompt, messages, original_image)
             messages.append(Message(Role.ASSISTANT, reply))
             try:
                 call = parse_reply(reply)
@@ -176,17 +179,19 @@ class Agent:
             if call["type"] == "final":
                 return Message(Role.ASSISTANT, call["message"])
 
-            result = self.call_tool(call, image, image_path, output_path)
+            result = self.call_tool(call, original_image, image_path, output_path)
             messages.append(Message(Role.TOOL, json.dumps(result), tool_name=call["name"]))
             if result.get("success"):
                 # Success ends the turn; the result is not sent back to the model (saves an API call).
                 return Message(Role.ASSISTANT, result.get("message") or json.dumps(result))
-            # ponytail: every tool error is retried, even ones the model can't fix; add a non-retryable flag if that wastes calls
+            if result.get("error_type") not in MODEL_FIXABLE:
+                # e.g. a disk or output-path error: another model attempt can't fix it, so stop now.
+                return Message(Role.ASSISTANT, f"Stopped [{result.get('error_type')}]: {result.get('error')}")
 
         return Message(Role.ASSISTANT,
                        f"Gave up after {self.max_attempts} attempts. Last error: {messages[-1].content}")
 
-    def call_tool(self, call: Dict[str, Any], image: Image.Image, image_path: str,
+    def call_tool(self, call: Dict[str, Any], original_image: Image.Image, image_path: str,
                   output_path: Optional[str] = None) -> Dict[str, Any]:
         """Check the model's arguments, then run the tool. The tool function runs only if every check passes.
         Never raises: problems come back as tool_error(...) for the model to fix."""
@@ -194,7 +199,8 @@ class Agent:
         if tool is None:
             return tool_error("unknown_tool", f"unknown tool {call['name']!r}; available: {list(self.tools)}")
         arguments = call["arguments"]
-        context = {"image": image, "image_path": image_path, "output_path": output_path}  # from Python, never the model
+        context = {"original_image": original_image, "image_path": image_path,
+                   "output_path": output_path}  # from Python, never the model
 
         # 1. Exactly the declared arguments: none missing, nothing extra (e.g. a path or image from the model).
         missing = [p for p in tool.parameter_schema if p not in arguments]
@@ -219,7 +225,11 @@ class Agent:
             return tool_error("tool_failed", f"{type(e).__name__}: {e}")
 
 
+# Tool errors the model can fix by sending a corrected call (each fix uses one model attempt).
+# Anything else (tool_failed: disk, output path, a bug in the tool) stops the run at once.
+MODEL_FIXABLE = {"unknown_tool", "missing_arguments", "unexpected_arguments", "invalid_arguments"}
+
+
 def tool_error(error_type: str, message: str) -> Dict[str, Any]:
-    """Every failed tool call has this shape. error_type is one of: unknown_tool, missing_arguments,
-    unexpected_arguments, invalid_arguments, tool_failed."""
+    """Every failed tool call has this shape. error_type is one of MODEL_FIXABLE, or tool_failed."""
     return {"success": False, "error_type": error_type, "error": message}

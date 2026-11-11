@@ -16,9 +16,12 @@ from agent import Agent, Message, Role, Tool
 
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 TIMEOUT_SECONDS = 30
+TRANSPORT_ATTEMPTS = 2  # first try + 1 retry for timeouts, rate limits and server errors
 OUTPUT_FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG"}
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")  # interactive chat only picks these
+OUTPUT_DIR = "outputs"  # default home for boxed results, apart from the original images
 
-USAGE = """Usage:
+USAGE = """Usage (flags are the preferred way):
   python chat.py --image dog.png --prompt "Draw a box around the dog" --output dog_boxed.png
   python chat.py --image environment.png --prompt "Box the cat and the dog"
   python chat.py      (interactive chat)
@@ -26,13 +29,13 @@ USAGE = """Usage:
   --image   input image, JPEG or PNG
   --prompt  what to box
   --output  where to save the boxed image (.png, .jpg or .jpeg). Optional: by default it is saved
-            next to the image as <name>_boxes.png, then <name>_boxes_2.png, ... so earlier
-            results are never overwritten."""
+            as outputs/<name>_boxes.png, then outputs/<name>_boxes_2.png, ... so earlier
+            results are never overwritten. The original image is never changed."""
 
 BANNER = f"""Bounding box agent ({MODEL})
 {USAGE}
 
-Interactive chat: write ONE line with what to box + the image path.
+Interactive chat: write ONE line with what to box + the image path (.png, .jpg or .jpeg).
   Examples: Draw a box around the dog in dog.png
             Box the cat and the dog in environment.png
             Is there a car in environment.png?   (no box if it isn't there)
@@ -91,8 +94,9 @@ def validate_boxes(boxes) -> None:
 
 
 def next_free_path(image_path: str) -> str:
-    """<name>_boxes.png, then <name>_boxes_2.png, _3, ... so earlier results are never overwritten."""
-    stem = os.path.splitext(image_path)[0] + "_boxes"
+    """outputs/<name>_boxes.png, then outputs/<name>_boxes_2.png, _3, ... so earlier results are never overwritten."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    stem = os.path.join(OUTPUT_DIR, os.path.splitext(os.path.basename(image_path))[0] + "_boxes")
     path, n = stem + ".png", 1
     while os.path.exists(path):
         n += 1
@@ -111,9 +115,10 @@ def check_output(output_path: str, image_path: str) -> None:
         raise ValueError("--output must not be the input image (it would be overwritten)")
 
 
-def draw_bounding_boxes(image: Image.Image, image_path: str, output_path: Optional[str], boxes: list) -> dict:
-    """Draw already-validated boxes (see validate_boxes). Saves to output_path, or next_free_path() if None."""
-    out = image.convert("RGBA")
+def draw_bounding_boxes(original_image: Image.Image, image_path: str, output_path: Optional[str], boxes: list) -> dict:
+    """Draw already-validated boxes (see validate_boxes) on a copy of the full-quality original.
+    Saves to output_path, or next_free_path() if None."""
+    out = original_image.convert("RGBA")  # convert() returns a new image; the original is untouched
     w, h = out.size
     draw = ImageDraw.Draw(out)
     line = max(2, round(min(w, h) / 150))
@@ -152,12 +157,72 @@ tools = [Tool(
 )]
 
 
+# ---------- Gemini copy of the image ----------
+# Three kinds of image, kept apart:
+#   original image  the user's file on disk; never changed or overwritten
+#   Gemini copy     in memory only, never saved; compressed or shrunk only if the request would be too big
+#   boxed result    a new file in outputs/ (or --output), drawn on the full-quality original
+# Boxes are 0-1000 relative to width and height, so a proportionally shrunk copy gives the same boxes.
+
+MB = 1024 * 1024
+REQUEST_BUDGET = 15 * MB      # our cap for the whole request; Gemini's inline limit is 20 MB
+REQUEST_OVERHEAD = 64 * 1024  # JSON field names, roles and other request metadata
+JPEG_QUALITY = 85
+SHRINK_STEP = 0.75            # each resize keeps 75% of width AND height, so proportions stay the same
+MIN_LONG_SIDE = 768           # never shrink the long side below this: stop instead
+
+
+class ImageTooLargeError(ValueError):
+    """The image can't fit the request budget without shrinking it too far. Raised before any request."""
+
+
+def base64_size(n_bytes: int) -> int:
+    return 4 * ((n_bytes + 2) // 3)  # inline images travel as base64: every 3 bytes become 4 characters
+
+
+def encode(img: Image.Image, fmt: str) -> bytes:
+    if fmt == "JPEG" and img.mode != "RGB":  # JPEG has no transparency: flatten onto white
+        rgba = img.convert("RGBA")
+        img = Image.new("RGB", img.size, "white")
+        img.paste(rgba, mask=rgba.getchannel("A"))
+    buf = io.BytesIO()
+    img.save(buf, format=fmt, **({"quality": JPEG_QUALITY} if fmt == "JPEG" else {}))
+    return buf.getvalue()
+
+
+def prepare_gemini_copy(original_image: Image.Image, text_bytes: int):
+    """Image bytes for Gemini, sized so the whole request (base64 image + text + overhead) fits REQUEST_BUDGET.
+    Tries: 1. PNG at full size  2. JPEG at full size  3. JPEG, shrunk proportionally step by step.
+    Never crops, stretches or rotates, and never changes original_image. Returns (bytes, mime_type, (w, h))."""
+    budget = REQUEST_BUDGET - REQUEST_OVERHEAD - text_bytes
+    data = encode(original_image, "PNG")
+    if base64_size(len(data)) <= budget:
+        return data, "image/png", original_image.size
+    copy = original_image
+    while True:
+        data = encode(copy, "JPEG")
+        if base64_size(len(data)) <= budget:
+            return data, "image/jpeg", copy.size
+        w, h = copy.size
+        smaller = (round(w * SHRINK_STEP), round(h * SHRINK_STEP))
+        if max(smaller) < MIN_LONG_SIDE:
+            raise ImageTooLargeError(
+                f"Image is too large: even as a {w}x{h} JPEG the request would be about "
+                f"{(base64_size(len(data)) + text_bytes + REQUEST_OVERHEAD) / MB:.1f} MB "
+                f"(limit {REQUEST_BUDGET / MB:.0f} MB). Use a smaller or simpler image.")
+        copy = original_image.resize(smaller, Image.Resampling.LANCZOS)  # always from the original: one resample
+
+
 # ---------- Gemini provider ----------
 
 @cache
 def client() -> genai.Client:
-    # Reads GEMINI_API_KEY / GOOGLE_API_KEY. The SDK does not retry by default, so this is the full wait.
-    return genai.Client(http_options=types.HttpOptions(timeout=TIMEOUT_SECONDS * 1000))  # milliseconds
+    # Reads GEMINI_API_KEY / GOOGLE_API_KEY.
+    # Transport retry: timeouts, network drops, 408, 429 and 5xx get ONE quick retry inside the same model step,
+    # so it never uses up a model attempt. Bad key, unknown model, 400 and 403 are not retried: they stop the run.
+    return genai.Client(http_options=types.HttpOptions(
+        timeout=TIMEOUT_SECONDS * 1000,  # milliseconds, per try
+        retry_options=types.HttpRetryOptions(attempts=TRANSPORT_ATTEMPTS, initial_delay=1, max_delay=4)))
 
 
 # HTTP status -> (error_type, what the user should do)
@@ -173,8 +238,10 @@ API_ERRORS = {
 def explain_api_error(e: Exception) -> Dict[str, str]:
     """Sort a failed model call into a category the user can act on: {"error_type", "error"}."""
     name = type(e).__name__
+    if isinstance(e, ImageTooLargeError):  # local, before any request
+        return {"error_type": "image_too_large", "error": str(e)}
     if "Timeout" in name:  # httpx/httpx2 ConnectTimeout, ReadTimeout, ...
-        return {"error_type": "timeout", "error": f"Gemini did not answer within {TIMEOUT_SECONDS} seconds. Try again."}
+        return {"error_type": "timeout", "error": f"Gemini did not answer within {TIMEOUT_SECONDS} seconds ({TRANSPORT_ATTEMPTS} tries). Try again."}
     if name == "ConnectError" or isinstance(e, ConnectionError):
         return {"error_type": "network_error", "error": f"Could not reach Gemini. Check the internet connection. ({e})"}
     if isinstance(e, genai_errors.APIError):
@@ -191,19 +258,23 @@ def explain_api_error(e: Exception) -> Dict[str, str]:
     return {"error_type": "unexpected_error", "error": f"{name}: {e}"}
 
 
-def gemini_llm(system_prompt: str, messages: List[Message], image: Image.Image) -> str:
+def gemini_llm(system_prompt: str, messages: List[Message], original_image: Image.Image) -> str:
     """Plain text in, plain text out. No SDK tool calling: the protocol is our own JSON."""
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    # ponytail: full-size PNG sent inline; very large photos can pass Gemini's ~20MB request limit, downscale if that happens
-    image_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
+    # Tool results and rejection notes are sent as user turns, labeled so the model can tell them apart.
+    texts = [f"[{m.tool_name or m.role.value} result] {m.content}" if m.role in (Role.TOOL, Role.SYSTEM) else m.content
+             for m in messages]
+    text_bytes = len(system_prompt.encode()) + sum(len(t.encode()) for t in texts)
+    data, mime_type, size = prepare_gemini_copy(original_image, text_bytes)  # raises before any request if too big
+    if size != original_image.size or mime_type != "image/png":
+        w, h = size
+        print(f"  [image] sent Gemini a {w}x{h} {mime_type.split('/')[1].upper()} copy "
+              f"({len(data) / MB:.1f} MB); boxes are drawn on the original")
+    image_part = types.Part.from_bytes(data=data, mime_type=mime_type)
     # The image goes once, on the newest message that named it (older images are not resent).
     image_at = max(i for i, m in enumerate(messages) if m.image_path)
 
     contents = []
-    for i, m in enumerate(messages):
-        # Tool results and rejection notes are sent as user turns, labeled so the model can tell them apart.
-        text = f"[{m.tool_name or m.role.value} result] {m.content}" if m.role in (Role.TOOL, Role.SYSTEM) else m.content
+    for i, (m, text) in enumerate(zip(messages, texts)):
         parts = [image_part] if i == image_at else []
         parts.append(types.Part.from_text(text=text))
         contents.append(types.Content(role="model" if m.role == Role.ASSISTANT else "user", parts=parts))
@@ -220,14 +291,13 @@ agent = Agent(tools=tools, llm=gemini_llm, instructions=BOX_FORMAT)
 # ---------- Chat loop ----------
 
 def find_image_path(text: str):
-    """First token in the input that is an existing file (validated later by load_image)."""
+    """First token in the input that is an existing .png/.jpg/.jpeg file (validated later by load_image)."""
     try:
         tokens = shlex.split(text)  # handles quoted / backslash-escaped paths from drag-and-drop
     except ValueError:              # e.g. an unmatched quote
         tokens = text.split()
     paths = (os.path.expanduser(t.rstrip("?!.,;:")) for t in tokens)  # "dog.png?" -> "dog.png"
-    # ponytail: picks the first existing file, so a word that matches a file name (e.g. "agent.py") wins; prefer image extensions if that bites
-    return next((p for p in paths if os.path.isfile(p)), None)
+    return next((p for p in paths if p.lower().endswith(IMAGE_EXTENSIONS) and os.path.isfile(p)), None)
 
 
 def handle(messages: List[Message], prompt: str, image_path: Optional[str], output_path: Optional[str] = None):
@@ -238,7 +308,7 @@ def handle(messages: List[Message], prompt: str, image_path: Optional[str], outp
         answer = agent.run(messages, output_path=output_path).content
     except Exception as e:
         error = explain_api_error(e)
-        answer = f"Model call failed [{error['error_type']}]: {error['error']}"
+        answer = f"Stopped [{error['error_type']}]: {error['error']}"
     for m in messages[before:]:  # model replies, tool results, retries
         print(f"  [{m.tool_name or m.role.value}] {m.content}")
     # Not added to `messages`: the history already holds the model's JSON reply (see Agent.run).
