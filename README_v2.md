@@ -47,7 +47,7 @@ CLI flags (`--image` etc.) don't work at the `You:` prompt. The chat says so and
 |---|---|
 | `agent.py` | The reusable library: `Role`, `Message`, `Tool`, `Agent`, strict reply parser, system prompt, image loader. Knows nothing about Gemini. |
 | `chat.py` | The demo: the three tools and their validators, coordinate helpers, the Gemini provider, image preparation, error classification, CLI and chat loop. |
-| `tests/` | 80 offline tests (`unittest` only, no API key, no network). |
+| `tests/` | 41 offline tests (`unittest` only, no API key, no network). |
 | `session*.md` | Transcripts of the build sessions, where the decisions below were made. |
 
 ## The tools
@@ -188,8 +188,8 @@ python -m unittest discover -s tests -v
 
 | File | Covers |
 |---|---|
-| `test_agent_unit.py` (27) | Message/tool validation (tool images), system prompt, strict parsing, `call_tool` errors, `Agent.run` stop/retry rules, `return_direct`, `max_steps`, per-request `state`, `limit_reached`, image loading |
-| `test_chat_unit.py` (45) | Box/label/region validation, drawing, cropping (never trims the object), zooming (pixels, 1024 px, proportions, size floor, 2-zoom limit, close-up coordinates), image budget and resizing, close-ups sent to Gemini, color-mode conversion, output paths, chat path parsing, CLI flags, API error classification, the tool prompt |
-| `test_integration.py` (8) | Real agent and tools with a scripted fake Gemini: valid call, box lands on the right pixels, retries, crop, whole-dog crops of `dog.png` and `environment.png`, zoom then draw lands on the dog in the full photo |
+| `test_agent_unit.py` (15) | Message/tool validation (tool images), system prompt, strict parsing, `call_tool` errors, `Agent.run` stop/retry rules, `return_direct`, `max_steps`, per-request `state`, `limit_reached`, image loading |
+| `test_chat_unit.py` (22) | Box/label/region validation, drawing, cropping (never trims the object), zooming (pixels, 1024 px, proportions, size floor, 2-zoom limit, close-up coordinates), image budget and resizing, close-ups sent to Gemini, color-mode conversion, output paths, chat path parsing, CLI flags, API error classification, the tool prompt |
+| `test_integration.py` (4) | Real agent and tools with a scripted fake Gemini: valid call, retry after bad coordinates, crop, zoom then draw lands on the dog in the full photo |
 
 Related cases are grouped with `subTest` tables. Outputs go to temp folders, and nothing touches the network.
