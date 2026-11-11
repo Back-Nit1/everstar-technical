@@ -185,11 +185,22 @@ def base64_size(n_bytes: int) -> int:
     return 4 * ((n_bytes + 2) // 3)  # inline images travel as base64: every 3 bytes become 4 characters
 
 
-def encode(img: Image.Image, fmt: str) -> bytes:
-    if fmt == "JPEG" and img.mode != "RGB":  # JPEG has no transparency: flatten onto white
+def safe_rgb(img: Image.Image) -> Image.Image:
+    """Plain 8-bit RGB that both PNG and JPEG can save (CMYK, 16-bit, palette and grayscale are converted;
+    transparency is flattened onto white). An RGB image is returned as is, with no extra copy."""
+    if img.mode == "RGB":
+        return img
+    if img.mode.startswith("I"):  # 16-bit grayscale: scale 0-65535 down to 0-255 (a plain convert clips to white)
+        return img.convert("I").point(lambda v: v / 256).convert("RGB")
+    if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
         rgba = img.convert("RGBA")
-        img = Image.new("RGB", img.size, "white")
-        img.paste(rgba, mask=rgba.getchannel("A"))
+        flat = Image.new("RGB", img.size, "white")
+        flat.paste(rgba, mask=rgba.getchannel("A"))
+        return flat
+    return img.convert("RGB")
+
+
+def encode(img: Image.Image, fmt: str) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format=fmt, **({"quality": JPEG_QUALITY} if fmt == "JPEG" else {}))
     return buf.getvalue()
@@ -197,13 +208,18 @@ def encode(img: Image.Image, fmt: str) -> bytes:
 
 def prepare_gemini_copy(original_image: Image.Image, text_bytes: int):
     """Image bytes for Gemini, sized so the whole request (base64 image + text + overhead) fits REQUEST_BUDGET.
-    Tries: 1. PNG at full size  2. JPEG at full size  3. JPEG, shrunk proportionally step by step.
+    The copy is plain RGB (safe_rgb). Then it tries:
+      1. PNG at full size (PNG inputs only: lossless for screenshots and diagrams)
+      2. JPEG at full size (JPEG inputs start here: re-saving a photo as PNG only wastes memory and bytes)
+      3. JPEG, shrunk proportionally step by step
     Never crops, stretches or rotates, and never changes original_image. Returns (bytes, mime_type, (w, h))."""
     budget = REQUEST_BUDGET - REQUEST_OVERHEAD - text_bytes
-    data = encode(original_image, "PNG")
-    if base64_size(len(data)) <= budget:
-        return data, "image/png", original_image.size
-    copy = original_image
+    safe = safe_rgb(original_image)
+    if original_image.format != "JPEG":
+        data = encode(safe, "PNG")
+        if base64_size(len(data)) <= budget:
+            return data, "image/png", safe.size
+    copy = safe
     while True:
         data = encode(copy, "JPEG")
         if base64_size(len(data)) <= budget:
@@ -215,7 +231,7 @@ def prepare_gemini_copy(original_image: Image.Image, text_bytes: int):
                 f"Image is too large: even as a {w}x{h} JPEG the request would be about "
                 f"{(base64_size(len(data)) + text_bytes + REQUEST_OVERHEAD) / MB:.1f} MB "
                 f"(limit {REQUEST_BUDGET / MB:.0f} MB). Use a smaller or simpler image.")
-        copy = original_image.resize(smaller, Image.Resampling.LANCZOS)  # always from the original: one resample
+        copy = safe.resize(smaller, Image.Resampling.LANCZOS)  # always from the full-size copy: one resample
 
 
 # ---------- Gemini provider ----------
@@ -270,9 +286,10 @@ def gemini_llm(system_prompt: str, messages: List[Message], original_image: Imag
              for m in messages]
     text_bytes = len(system_prompt.encode()) + sum(len(t.encode()) for t in texts)
     data, mime_type, size = prepare_gemini_copy(original_image, text_bytes)  # raises before any request if too big
-    if size != original_image.size or mime_type != "image/png":
+    sent_as = "JPEG" if mime_type == "image/jpeg" else "PNG"
+    if size != original_image.size or sent_as != original_image.format:  # only mention a changed copy
         w, h = size
-        print(f"  [image] sent Gemini a {w}x{h} {mime_type.split('/')[1].upper()} copy "
+        print(f"  [image] sent Gemini a {w}x{h} {sent_as} copy "
               f"({len(data) / MB:.1f} MB); boxes are drawn on the original")
     image_part = types.Part.from_bytes(data=data, mime_type=mime_type)
     # The image goes once, on the newest message that named it (older images are not resent).

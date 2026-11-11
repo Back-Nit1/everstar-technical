@@ -72,7 +72,9 @@ def load_image(path: str) -> Image.Image:
                              "multi-page and animated images are not supported")
         img.verify()  # integrity check; Pillow needs the file reopened afterwards
     with Image.open(path) as img:
-        return ImageOps.exif_transpose(img)  # returns a fully loaded copy; boxes match what the model sees
+        upright = ImageOps.exif_transpose(img)  # returns a fully loaded copy; boxes match what the model sees
+        upright.format = img.format  # the copy forgets it; the Gemini copy uses it to pick JPEG or PNG
+        return upright
 
 
 # ---------- Parsing the model's reply ----------
