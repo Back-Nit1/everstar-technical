@@ -29,8 +29,8 @@ USAGE = """Usage (flags are the preferred way):
   --image   input image, JPEG or PNG
   --prompt  what to box
   --output  where to save the boxed image (.png, .jpg or .jpeg). Optional: by default it is saved
-            as outputs/<name>_boxes.png, then outputs/<name>_boxes_2.png, ... so earlier
-            results are never overwritten. The original image is never changed."""
+            as outputs/<name>_boxes.png. If the file already exists, _2, _3, ... is added to the
+            name, so earlier results are never overwritten. The original image is never changed."""
 
 BANNER = f"""Bounding box agent ({MODEL})
 {USAGE}
@@ -93,15 +93,20 @@ def validate_boxes(boxes) -> None:
             raise ValueError(f"{where}.box needs y_min < y_max and x_min < x_max, got {box}")
 
 
-def next_free_path(image_path: str) -> str:
-    """outputs/<name>_boxes.png, then outputs/<name>_boxes_2.png, _3, ... so earlier results are never overwritten."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    stem = os.path.join(OUTPUT_DIR, os.path.splitext(os.path.basename(image_path))[0] + "_boxes")
-    path, n = stem + ".png", 1
+def next_free_path(path: str) -> str:
+    """path if it is free, else <stem>_2<ext>, <stem>_3<ext>, ... so earlier results are never overwritten."""
+    stem, ext = os.path.splitext(path)
+    n = 1
     while os.path.exists(path):
         n += 1
-        path = f"{stem}_{n}.png"
+        path = f"{stem}_{n}{ext}"
     return path
+
+
+def default_output_path(image_path: str) -> str:
+    """outputs/<name>_boxes.png for the given input image."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return os.path.join(OUTPUT_DIR, os.path.splitext(os.path.basename(image_path))[0] + "_boxes.png")
 
 
 def check_output(output_path: str, image_path: str) -> None:
@@ -117,7 +122,7 @@ def check_output(output_path: str, image_path: str) -> None:
 
 def draw_bounding_boxes(original_image: Image.Image, image_path: str, output_path: Optional[str], boxes: list) -> dict:
     """Draw already-validated boxes (see validate_boxes) on a copy of the full-quality original.
-    Saves to output_path, or next_free_path() if None."""
+    Saves to output_path (or outputs/<name>_boxes.png if None), numbered if that file already exists."""
     out = original_image.convert("RGBA")  # convert() returns a new image; the original is untouched
     w, h = out.size
     draw = ImageDraw.Draw(out)
@@ -132,7 +137,7 @@ def draw_bounding_boxes(original_image: Image.Image, image_path: str, output_pat
         draw.text((px[0], px[1]), label, fill="white", font=font)
         drawn.append({"label": label, "box_px": px})
 
-    out_path = output_path or next_free_path(image_path)
+    out_path = next_free_path(output_path or default_output_path(image_path))
     fmt = OUTPUT_FORMATS[os.path.splitext(out_path)[1].lower()]
     (out.convert("RGB") if fmt == "JPEG" else out).save(out_path, format=fmt)  # JPEG has no alpha channel
     labels = ", ".join(d["label"] for d in drawn)
@@ -291,13 +296,14 @@ agent = Agent(tools=tools, llm=gemini_llm, instructions=BOX_FORMAT)
 # ---------- Chat loop ----------
 
 def find_image_path(text: str):
-    """First token in the input that is an existing .png/.jpg/.jpeg file (validated later by load_image)."""
+    """First token in the input that names a .png/.jpg/.jpeg file, whether or not it exists.
+    The caller checks it exists, so a mistyped name is reported instead of reusing an earlier image."""
     try:
         tokens = shlex.split(text)  # handles quoted / backslash-escaped paths from drag-and-drop
     except ValueError:              # e.g. an unmatched quote
         tokens = text.split()
     paths = (os.path.expanduser(t.rstrip("?!.,;:")) for t in tokens)  # "dog.png?" -> "dog.png"
-    return next((p for p in paths if p.lower().endswith(IMAGE_EXTENSIONS) and os.path.isfile(p)), None)
+    return next((p for p in paths if p.lower().endswith(IMAGE_EXTENSIONS)), None)
 
 
 def handle(messages: List[Message], prompt: str, image_path: Optional[str], output_path: Optional[str] = None):
@@ -350,7 +356,11 @@ def main():
             break
         if user_input.lower() == "exit":
             break
-        handle(messages, user_input, find_image_path(user_input))
+        image_path = find_image_path(user_input)
+        if image_path and not os.path.isfile(image_path):  # named an image that isn't there: no model call
+            print(f"AI: Image not found: {image_path}")
+            continue
+        handle(messages, user_input, image_path)  # no image named: reuses the last one (follow-ups)
 
 
 if __name__ == "__main__":
